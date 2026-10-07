@@ -5,3 +5,4 @@ scikit-image   # >=0.26 uses max_size; older versions are also supported
 skan
 networkx
 matplotlib
+pillow         # reads image sizes when selecting tiles

@@ -4,9 +4,10 @@ main
 
 Entry point of the image -> graph pipeline.
 
-Takes a photomicrograph (already binarized, or raw with ``--binarize``) and,
-optionally, the electrode masks, extracts the network with
-``SkeletonAnalysis`` and saves the graph as .graphml.
+Takes a photomicrograph (already binarized, or raw with ``--binarize``), or a
+folder of tiles to stitch first with Fiji (``--stitch``), and optionally the
+electrode masks; extracts the network with ``SkeletonAnalysis`` and saves the
+graph as .graphml.
 
 Examples
 --------
@@ -18,6 +19,9 @@ Examples
 
     # Raw image: binarize first, then extract the graph
     python main.py --image path/M5.tif --binarize --block-size 151 --C 15 --threshold 55
+
+    # Folder of tiles: stitch with Fiji, binarize, then extract the graph
+    python main.py --stitch path/M5_tiles --fiji C:/fiji-stable-win64-jdk/Fiji.app
 
     # With electrodes, also saving the figure of the graph over the image
     python main.py --image path/M5_binary.tif \
@@ -32,6 +36,7 @@ import cv2
 
 import preprocessing as pre
 from SkeletonAnalysis import SkeletonAnalysis
+from stitching import stitch
 
 # Defaults: the example sample included in ./example/M4
 SAMPLE = "M4"
@@ -59,6 +64,16 @@ def parse_args():
     p.add_argument("--no-clean", action="store_true",
                    help="Do not prune degree-1 nodes nor collapse degree-2 nodes.")
 
+    s = p.add_argument_group("stitching (Fiji, see stitching.py for all options)")
+    s.add_argument("--stitch", metavar="TILES_DIR", default=None,
+                   help="Folder of tiles: stitch them with Fiji first (implies --binarize). "
+                        "The mosaic is saved as <TILES_DIR>/Fused.tif unless --image is given.")
+    s.add_argument("--fiji", default=None, help="Fiji.app folder or launcher (or set FIJI_PATH).")
+    s.add_argument("--stitch-mode", choices=("unknown", "positions"), default="unknown",
+                   help="'unknown': the plugin finds the arrangement (default); "
+                        "'positions': use <TILES_DIR>/TileConfiguration.txt.")
+    s.add_argument("--fiji-memory", default=None, help="Java heap for Fiji, e.g. 8g.")
+
     b = p.add_argument_group("binarization (only with --binarize)")
     b.add_argument("--binarize", action="store_true",
                    help="The image is raw: binarize it before extracting the graph.")
@@ -79,6 +94,13 @@ def main():
     using_default = args.image == IMG_PATH
 
     img_path = args.image
+    if args.stitch:
+        using_default = False
+        mosaic = None if args.image == IMG_PATH else args.image
+        img_path = stitch(args.stitch, output_path=mosaic, mode=args.stitch_mode,
+                          fiji_path=args.fiji, memory=args.fiji_memory, verbose=verbose)
+        args.binarize = True
+
     if args.binarize:
         img = pre.load_gray(img_path)
         if img is None:
