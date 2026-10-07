@@ -1,0 +1,7 @@
+opencv-python
+numpy
+scipy
+scikit-image   # >=0.26 uses max_size; older versions are also supported
+skan
+networkx
+matplotlib
