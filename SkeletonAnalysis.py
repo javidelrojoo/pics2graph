@@ -39,17 +39,49 @@ def remove_small_objects(ar, max_size):
         return _remove_small_objects(ar, min_size=max_size + 1)
 
 
+def _as_gray_uint8(img):
+    """Convert an array (bool, gray, RGB/RGBA, any dtype) to a uint8 grayscale image."""
+    img = np.asarray(img)
+    if img.dtype == bool:
+        return img.astype(np.uint8) * 255
+    if img.ndim == 3:
+        img = img[..., :3]
+        if img.dtype != np.uint8:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    if img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return img
+
+
+def _load_mask(mask):
+    """A mask given as a path or as an array, returned as a uint8 grayscale image."""
+    if isinstance(mask, (str, bytes)) or hasattr(mask, "__fspath__"):
+        return cv2.imread(mask, cv2.IMREAD_GRAYSCALE)
+    return _as_gray_uint8(mask)
+
+
 class SkeletonAnalysis:
-    def __init__(self, img_path):
+    def __init__(self, img_path=None, img=None):
+        """
+        Load the binarized image, either from ``img_path`` or directly as an
+        array with ``img`` (e.g. ``SkeletonAnalysis(img=binary_mask)``).
+        """
+        if img_path is None and img is None:
+            raise ValueError("Pass img_path or img.")
         self.img_path = img_path
-        self.img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            self.img = _as_gray_uint8(img)
+        else:
+            self.img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         self.img_original = self.img.copy() if self.img is not None else None  # before img_cleaning, for plots
         self.original_img_path = None         # optional: path to the original micrograph
         self.has_electrodes = False
 
     def load_electrodes(self, path1, path2):
-        self.electrode_mask1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
-        self.electrode_mask2 = cv2.imread(path2, cv2.IMREAD_GRAYSCALE)
+        """Load the Vin and Vout masks, given as paths or as arrays."""
+        self.electrode_mask1 = _load_mask(path1)
+        self.electrode_mask2 = _load_mask(path2)
 
         self.electrode_mask1 = binary_fill_holes(self.electrode_mask1)
         self.electrode_mask2 = binary_fill_holes(self.electrode_mask2)

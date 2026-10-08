@@ -19,6 +19,7 @@ tiles ──(stitching, Fiji)──► raw image ──(preprocessing)──► 
 | `SkeletonAnalysis.py` | Morphological cleaning, skeletonization, graph extraction and pruning, line graph and export. |
 | `visualization.py` | Plots the graph (or the line graph) overlaid on the image. |
 | `main.py` | Command-line entry point. |
+| `gui.py` | Graphical interface (napari) covering the whole pipeline. |
 | `example/M4/` | Example sample: binary image and the masks of the two electrodes. |
 
 ## Installation
@@ -33,6 +34,22 @@ Stitching additionally needs a local [Fiji](https://fiji.sc) installation (the S
 setx FIJI_PATH "C:\fiji-stable-win64-jdk\Fiji.app"     # Windows (open a new terminal afterwards)
 export FIJI_PATH=/path/to/Fiji.app                     # Linux / macOS
 ```
+
+## Graphical interface
+
+```bash
+python gui.py                     # empty viewer
+python gui.py path/to/M5.tif      # open a micrograph directly
+```
+
+It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the right, one tab per stage:
+
+1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal).
+2. **Binarize**: adaptive binarization with live preview while you move *block size*, *C* and the intensity threshold. The result is an editable `binary` layer: select it and use napari's brush (label 1) to add wire pixels or the eraser to remove them. *Save binary image...* exports it.
+3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, or load existing masks. *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
+4. **Graph**: extract the graph (optional cleaning and electrodes), view the spatial graph G or the line graph L over the image with zoom, and export the `.graphml`, a figure or a screenshot.
+
+Every layer can be hidden, made more transparent or edited with napari's own tools (left panel). Long tasks (stitching, graph extraction) run in the background, so the window stays responsive.
 
 ## Quick start (command line)
 
@@ -175,6 +192,8 @@ SA.save_graph("output.graphml", save_line_graph=True)
 ## Notes
 
 * The stitching was checked against a mosaic made by hand in Fiji (sample M4, 6 tiles): `stitch(...)` with default parameters gives the same 2767 × 2424 image (mean difference 0.3 gray levels out of 255).
+* `SkeletonAnalysis` accepts the binary image and the electrode masks either as file paths or as arrays (`SkeletonAnalysis(img=mask)`, `load_electrodes(mask1, mask2)`).
+* The project uses `opencv-python-headless` (OpenCV without its own windows), which avoids Qt conflicts with napari. If you already had `opencv-python` installed, uninstall it first: `pip uninstall opencv-python`.
 * The input image to `SkeletonAnalysis` must be binarized (wires in white), preferably as `.tif`.
 * Compatible with scikit-image both before and after 0.26 (change from `min_size`/`area_threshold` to `max_size`).
 * With the example sample, `python main.py` reproduces the thesis' `M4_effective.graphml` (6703 nodes and 13242 edges in the line graph).
