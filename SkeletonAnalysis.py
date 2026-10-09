@@ -61,6 +61,36 @@ def _load_mask(mask):
     return _as_gray_uint8(mask)
 
 
+def _graphml_value(v):
+    """A value GraphML can store (bool/int/float/str), or None to drop it."""
+    if isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, np.generic):          # numpy scalar -> Python scalar
+        return v.item()
+    return None                            # arrays, tuples, lists, dtypes...
+
+
+def graphml_safe(G):
+    """
+    Copy of ``G`` keeping only attributes GraphML can store.
+
+    skan stores, for each skeleton branch, the pixel path as numpy arrays
+    (``path``, ``indices``, ``values``) and the image ``shape``/``dtype`` as
+    graph attributes; ``nx.write_graphml`` cannot write those, so they are
+    dropped. Scalar attributes are kept.
+    """
+    H = nx.Graph() if not G.is_directed() else nx.DiGraph()
+    H.graph.update({k: v for k, v in ((k, _graphml_value(v)) for k, v in G.graph.items())
+                    if v is not None})
+    for n, d in G.nodes(data=True):
+        H.add_node(n, **{k: v for k, v in ((k, _graphml_value(v)) for k, v in d.items())
+                         if v is not None})
+    for u, v, d in G.edges(data=True):
+        H.add_edge(u, v, **{k: x for k, x in ((k, _graphml_value(x)) for k, x in d.items())
+                            if x is not None})
+    return H
+
+
 class SkeletonAnalysis:
     def __init__(self, img_path=None, img=None):
         """
@@ -200,10 +230,28 @@ class SkeletonAnalysis:
         self.L = nx.Graph(self.L)
 
     def save_graph(self, path, save_line_graph=True):
+        """
+        Export to .graphml: the line graph ``L`` (default) or the spatial graph
+        ``G``. For ``G``, non-scalar attributes from skan (branch pixel paths,
+        image shape) are dropped, and each node gets its pixel coordinates as
+        ``x`` and ``y`` attributes (electrode nodes: their contact point).
+        """
         if save_line_graph:
             nx.write_graphml(self.L, path)
-        else:
-            nx.write_graphml(self.G, path)
+            return
+        H = graphml_safe(self.G)
+        if hasattr(self, "img") and self.img is not None:
+            H.graph["image_height"], H.graph["image_width"] = map(int, self.img.shape[:2])
+        electrode_pos = getattr(self, "electrode_pos", {})
+        for n in H.nodes:
+            if n in electrode_pos:
+                x, y = electrode_pos[n]
+            elif isinstance(n, (int, np.integer)) and 0 <= n < len(self.node_coords):
+                y, x = self.node_coords[n]
+            else:
+                continue
+            H.nodes[n]["x"], H.nodes[n]["y"] = float(x), float(y)
+        nx.write_graphml(H, path)
 
     def plot_graph(self, save_path=None):
         pos = {}

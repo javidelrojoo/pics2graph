@@ -223,7 +223,7 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`get_network()`**: converts the skeleton into a graph (`skan` → networkx) and adds `Vin_i` / `Vout_i` nodes where the skeleton touches the electrodes.
 * **`clean_network()`**: iteratively removes isolated nodes, prunes degree-1 nodes, collapses degree-2 nodes and removes edges between electrodes.
 * **`convert_to_line_graph()`**: builds `SA.L`, the line graph of `SA.G`.
-* **`save_graph(path, save_line_graph=True)`**: exports to `.graphml`.
+* **`save_graph(path, save_line_graph=True)`**: exports to `.graphml`. When saving the spatial graph `G`, the non-scalar attributes added by skan (pixel path of each branch, image shape) are dropped, since GraphML cannot store them, and each node gets its pixel coordinates as `x` / `y` attributes (electrode nodes: their contact point); the image size is stored as `image_height` / `image_width`.
 * **`plot_graph(save_path=None)`**: quick plot of the graph over the image.
 * **`complete_analysis(clean_network=True, electrodes_path=None, save_graph_path=None, plot=False, save_plot_path=None, verbose=False, opening_radius=1, min_object_size=0, closing_radius=0)`**: runs the whole pipeline.
 
