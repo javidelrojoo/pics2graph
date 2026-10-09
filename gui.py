@@ -18,31 +18,62 @@ The panel on the right has one tab per stage of the pipeline:
 
 Every layer can be toggled, zoomed and edited with napari's own tools; the
 panel only adds the pipeline steps on top.
+
+Startup: only Qt is imported at first, so a loading window appears right away;
+napari and the image-analysis libraries (which can take tens of seconds the
+first time after installing or rebooting) are loaded afterwards, reporting each
+step both in that window and in the terminal.
 """
 
 import os
 import sys
+import time
 
-import matplotlib
-matplotlib.use("Agg")       # figures are only saved to disk, never shown
-
-import cv2
-import numpy as np
-import napari
-from napari.qt.threading import thread_worker
-from napari.utils.notifications import show_error, show_info, show_warning
 from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QColor, QFont, QPainter, QPixmap
 from qtpy.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
-    QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
+    QSpinBox, QSplashScreen, QTabWidget, QVBoxLayout, QWidget,
 )
 
-import preprocessing as pre
-import stitching as st
-from SkeletonAnalysis import SkeletonAnalysis
-from visualization import (get_line_graph_positions, get_node_positions,
-                           plot_line_graph_on_image, plot_network_on_image)
+_T0 = time.time()
+_LOADED = False
+
+
+def _load_modules(report=print):
+    """
+    Import the heavy dependencies (napari, OpenCV, scikit-image, skan,
+    matplotlib) into this module's namespace, calling ``report(msg)`` before
+    each step so the user can see that the program is loading, not frozen.
+    """
+    global _LOADED, cv2, np, napari, thread_worker, show_error, show_info, show_warning
+    global pre, st, SkeletonAnalysis
+    global get_line_graph_positions, get_node_positions
+    global plot_line_graph_on_image, plot_network_on_image
+    if _LOADED:
+        return
+
+    report("Loading napari (the slowest step, especially the first time)...")
+    import napari
+    from napari.qt.threading import thread_worker
+    from napari.utils.notifications import show_error, show_info, show_warning
+
+    report("Loading OpenCV and NumPy...")
+    import cv2
+    import numpy as np
+
+    report("Loading scikit-image and skan...")
+    import preprocessing as pre
+    from SkeletonAnalysis import SkeletonAnalysis
+
+    report("Loading matplotlib and the stitching module...")
+    import matplotlib
+    matplotlib.use("Agg")       # figures are only saved to disk, never shown
+    import stitching as st
+    from visualization import (get_line_graph_positions, get_node_positions,
+                               plot_line_graph_on_image, plot_network_on_image)
+    _LOADED = True
 
 # Layer names
 RAW = "micrograph"
@@ -60,7 +91,7 @@ IMAGE_FILTER = "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp *.JPG *.TIF);;All 
 # =============================================================================
 #  I/O helpers (work with non-ASCII paths on Windows, unlike cv2.imread)
 # =============================================================================
-def imread(path, flags=cv2.IMREAD_UNCHANGED):
+def imread(path, flags=-1):          # -1 == cv2.IMREAD_UNCHANGED
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
     if img is None:
         raise IOError(f"Could not read {path}")
@@ -852,18 +883,73 @@ class Pics2GraphWidget(QWidget):
 # =============================================================================
 #  Entry point
 # =============================================================================
-def launch(image_path=None, show=True):
+class _Splash(QSplashScreen):
+    """Small loading window shown while the heavy libraries are imported."""
+
+    def __init__(self):
+        pix = QPixmap(520, 170)
+        pix.fill(QColor("#262930"))                      # napari's dark background
+        p = QPainter(pix)
+        p.setPen(QColor("#f0f1f2"))
+        font = QFont()
+        font.setPointSize(22)
+        font.setBold(True)
+        p.setFont(font)
+        p.drawText(28, 62, "pics2graph")
+        font.setPointSize(10)
+        font.setBold(False)
+        p.setFont(font)
+        p.setPen(QColor("#9da3ae"))
+        p.drawText(30, 90, "photomicrograph -> graph")
+        p.end()
+        super().__init__(pix)
+        self._start = time.time()
+
+    def report(self, msg):
+        elapsed = time.time() - self._start
+        self.showMessage(f"   {msg}   ({elapsed:.0f} s)\n",
+                         Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft,
+                         QColor("#f0f1f2"))
+        QApplication.processEvents()
+
+
+def _console(msg):
+    print(f"[pics2graph {time.time() - _T0:5.1f} s] {msg}", flush=True)
+
+
+def launch(image_path=None, show=True, report=None):
     """Create the viewer with the pics2graph panel and return (viewer, panel)."""
+    report = report or _console
+    _load_modules(report)
+    report("Opening the window...")
     viewer = napari.Viewer(title="pics2graph", show=show)
     panel = Pics2GraphWidget(viewer)
     viewer.window.add_dock_widget(panel, name="pics2graph", area="right")
     if image_path:
+        report(f"Opening {os.path.basename(image_path)}...")
         panel.open_raw(image_path)
     return viewer, panel
 
 
 def main():
-    launch(sys.argv[1] if len(sys.argv) > 1 else None)
+    _console("Starting (the first run after installing or rebooting can take "
+             "up to a minute)...")
+    app = QApplication.instance() or QApplication(sys.argv)
+    splash = _Splash()
+    splash.show()
+    app.processEvents()
+
+    def report(msg):
+        _console(msg)
+        splash.report(msg)
+
+    try:
+        viewer, _ = launch(sys.argv[1] if len(sys.argv) > 1 else None, report=report)
+    except Exception:
+        splash.close()
+        raise
+    splash.finish(viewer.window._qt_window)
+    _console("Ready.")
     napari.run()
 
 

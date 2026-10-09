@@ -49,6 +49,8 @@ It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the 
 3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, or load existing masks. *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
 4. **Graph**: extract the graph (optional cleaning and electrodes), view the spatial graph G or the line graph L over the image with zoom, and export the `.graphml`, a figure or a screenshot.
 
+Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
+
 Every layer can be hidden, made more transparent or edited with napari's own tools (left panel). Long tasks (stitching, graph extraction) run in the background, so the window stays responsive.
 
 ## Quick start (command line)
