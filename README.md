@@ -87,11 +87,35 @@ Main options (`python main.py -h` lists them all):
 | `--output` | Path of the `.graphml` (defaults to next to the image). |
 | `--graph {line,spatial}` | Graph to save: line graph (nodes = wires, default) or spatial graph (nodes = junctions). |
 | `--no-clean` | Do not prune degree-1 nodes nor collapse degree-2 nodes. |
+| `--opening-radius`, `--closing-radius`, `--min-object-size` | Cleaning before skeletonizing (see *Binarization and cleaning parameters*). |
 | `--stitch TILES_DIR` | Stitch the tiles in that folder with Fiji first (implies `--binarize`). |
 | `--fiji`, `--stitch-mode {unknown,positions}`, `--fiji-memory` | Fiji location, stitching mode and Java memory. |
 | `--stitch-downsample N`, `--stitch-gray` | Reduce the tiles N times / convert them to 8-bit gray before stitching (large sets). |
 | `--binarize`, `--block-size`, `--C`, `--threshold` | Prior adaptive binarization and its parameters. |
 | `--plot`, `--save-plot` | Show / save the graph over the image. |
+
+## Binarization and cleaning parameters
+
+The defaults (`block_size=151, C=15, intensity_thresh=55`, opening of radius 1) were made for **optical dark-field** micrographs, where the background is close to black. They do **not** work for SEM images: the background is mid-gray, so `C=15` (threshold *below* the local mean) marks most of it as wire (in tests only 24 % of the detected "wire" pixels were real).
+
+Starting points for SEM images of AgNW networks (Zeiss, 8192 × 6144 px tiles, wires 4–6 px wide at full resolution), available as presets in the GUI (tab 2):
+
+| Preset | block size | C | intensity threshold | closing radius | opening radius | remove specks (px) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Optical dark-field (default) | 151 | 15 | 55 | 0 | 1 | 0 |
+| SEM, tiles downsampled 4× | 21 | −11 | 0 | 1 | 0 | 10 |
+| SEM, tiles downsampled 2× | 61 | −23 | 0 | 2 | 0 | 10 |
+
+From the command line: `--block-size 61 --C -23 --threshold 0 --closing-radius 2 --opening-radius 0 --min-object-size 10`.
+
+How they were chosen and what to keep in mind:
+
+* **Negative C** keeps only pixels clearly brighter than their surroundings.
+* **No opening for thin wires.** The opening (radius 1) removes structures thinner than 3 px: on SEM mosaics downsampled 4× (wires 1–2 px) it erased 85–90 % of the wires, and 25–30 % at 2×.
+* **A closing is needed.** In some regions the SEM shows the wires with bright edges and a darker core; the threshold then breaks them into fragments, and since `clean_network` prunes everything that is not part of a cycle, the graph falls apart (a binarization with 98 % pixel agreement gave 6 nodes instead of ~4000). A closing of radius 1–2 bridges those gaps.
+* The values were chosen by comparing the resulting **graph** (number of nodes after cleaning) with the graph of a reference segmentation made at full resolution and reduced to the same scale, on tiles from a dark and a bright region: 0.76–0.99 of the reference nodes at 4×, 0.98–1.03 at 2×.
+* **Resolution changes the topology in dense regions.** Compared with the full-resolution reference, the graph at 4× had about the same number of nodes in a sparse region but ~3× more in a dense region with many nearly parallel wires (they touch at low resolution and create spurious junctions); at 2× it was 1.2–1.9×. For quantitative results in dense areas, analyze at the highest resolution you can, e.g. by regions.
+* The graph is very sensitive to these settings: always check the binary layer and the graph visually before trusting the numbers.
 
 ## Stitching (`stitching.py`)
 
@@ -194,14 +218,14 @@ SA.save_graph("output.graphml", save_line_graph=True)
 
 * **`__init__(img_path)`**: loads the binarized image.
 * **`load_electrodes(path1, path2)`**: loads the Vin and Vout masks (fills holes and removes small objects).
-* **`img_cleaning()`**: removes small holes and applies an opening with a disk of radius 1.
+* **`img_cleaning(hole_size=2, opening_radius=1, min_object_size=0, closing_radius=0)`**: optional closing (bridges small gaps), fills small holes, applies an opening with a disk of `opening_radius` (0 = none) and removes objects of up to `min_object_size` px. The defaults reproduce the original behavior (holes + opening of radius 1).
 * **`skeletonize()`**: reduces structures to 1-pixel width; if there are electrodes, removes them from the skeleton and keeps dilated masks to connect them.
 * **`get_network()`**: converts the skeleton into a graph (`skan` → networkx) and adds `Vin_i` / `Vout_i` nodes where the skeleton touches the electrodes.
 * **`clean_network()`**: iteratively removes isolated nodes, prunes degree-1 nodes, collapses degree-2 nodes and removes edges between electrodes.
 * **`convert_to_line_graph()`**: builds `SA.L`, the line graph of `SA.G`.
 * **`save_graph(path, save_line_graph=True)`**: exports to `.graphml`.
 * **`plot_graph(save_path=None)`**: quick plot of the graph over the image.
-* **`complete_analysis(clean_network=True, electrodes_path=None, save_graph_path=None, plot=False, save_plot_path=None, verbose=False)`**: runs the whole pipeline.
+* **`complete_analysis(clean_network=True, electrodes_path=None, save_graph_path=None, plot=False, save_plot_path=None, verbose=False, opening_radius=1, min_object_size=0, closing_radius=0)`**: runs the whole pipeline.
 
 ### `visualization.py`
 

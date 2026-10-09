@@ -63,6 +63,15 @@ def parse_args():
                         "or the spatial graph (nodes = junctions).")
     p.add_argument("--no-clean", action="store_true",
                    help="Do not prune degree-1 nodes nor collapse degree-2 nodes.")
+    p.add_argument("--opening-radius", type=int, default=1,
+                   help="Radius of the morphological opening before skeletonizing "
+                        "(default 1; use 0 when the wires are 1-2 px wide, e.g. SEM "
+                        "stitched with --stitch-downsample 2 or more).")
+    p.add_argument("--min-object-size", type=int, default=0,
+                   help="Remove objects of up to this many pixels before skeletonizing.")
+    p.add_argument("--closing-radius", type=int, default=0,
+                   help="Radius of a morphological closing before skeletonizing, to keep "
+                        "thin noisy wires continuous (SEM: 1 at downsample 4, 2 at downsample 2).")
 
     s = p.add_argument_group("stitching (Fiji, see stitching.py for all options)")
     s.add_argument("--stitch", metavar="TILES_DIR", default=None,
@@ -139,6 +148,9 @@ def main():
         save_graph_path=None,
         plot=False,
         verbose=verbose,
+        opening_radius=args.opening_radius,
+        min_object_size=args.min_object_size,
+        closing_radius=args.closing_radius,
     )
     SA.save_graph(output, save_line_graph=(args.graph == "line"))
     if verbose:

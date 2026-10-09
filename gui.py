@@ -95,6 +95,18 @@ NODES = "graph nodes"
 
 VIN, VOUT = 1, 2            # label values in the electrodes layer
 
+# Binarization presets: (block size, C, intensity threshold, opening radius,
+# closing radius, min object size). The SEM values were tuned on Zeiss SEM
+# tiles of AgNW networks (8192 x 6144 px, wires 4-6 px wide at full
+# resolution), choosing the settings whose graph best matched the graph of a
+# reference segmentation at the same resolution, in both dark and bright
+# regions. Treat them as starting points and check the result visually.
+PRESETS = {
+    "Optical dark-field (default)": (151, 15, 55, 1, 0, 0),
+    "SEM, tiles downsampled 4x": (21, -11, 0, 0, 1, 10),
+    "SEM, tiles downsampled 2x": (61, -23, 0, 0, 2, 10),
+}
+
 IMAGE_FILTER = "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp *.JPG *.TIF);;All files (*)"
 
 
@@ -521,10 +533,18 @@ class Pics2GraphWidget(QWidget):
 
         box = QGroupBox("Adaptive binarization")
         f = QFormLayout(box)
+        self.bin_preset = _combo(list(PRESETS))
+        self.bin_preset.setToolTip(
+            "Starting values for each kind of image. They also set the cleaning\n"
+            "used before skeletonizing (tab 4): thin SEM wires need no opening.")
+        self.bin_preset.currentTextChanged.connect(self.apply_preset)
+        f.addRow("Preset", self.bin_preset)
         self.bin_block = _spin(3, 4001, 151, 2)
         self.bin_block.setToolTip("Size of the local window (odd).")
         self.bin_C = _spin(-255, 255, 15)
-        self.bin_C.setToolTip("Constant subtracted from the local mean: higher = fewer wire pixels.")
+        self.bin_C.setToolTip("Constant subtracted from the local mean: higher = more wire pixels.\n"
+                              "Negative values (e.g. -22) keep only pixels clearly brighter than "
+                              "their surroundings (SEM).")
         self.bin_thresh = _spin(0, 255, 55)
         self.bin_thresh.setToolTip("Pixels darker than this are always background.")
         self.bin_live = QCheckBox("Live preview")
@@ -554,6 +574,22 @@ class Pics2GraphWidget(QWidget):
         lay.addWidget(box)
         lay.addStretch()
         return w
+
+    def apply_preset(self, name):
+        if name not in PRESETS:
+            return
+        block, C, thresh, opening_r, closing_r, min_obj = PRESETS[name]
+        for w, v in ((self.bin_block, block), (self.bin_C, C), (self.bin_thresh, thresh)):
+            w.blockSignals(True)
+            w.setValue(v)
+            w.blockSignals(False)
+        self.g_opening.setValue(opening_r)
+        self.g_closing.setValue(closing_r)
+        self.g_min_obj.setValue(min_obj)
+        self._schedule_preview()
+        self.status.setText(f"Preset '{name}': block {block}, C {C}, threshold {thresh}; "
+                            f"cleaning: closing {closing_r}, opening {opening_r}, "
+                            f"specks up to {min_obj} px removed.")
 
     def _schedule_preview(self):
         if self.bin_live.isChecked() and self.raw_gray is not None:
@@ -752,6 +788,20 @@ class Pics2GraphWidget(QWidget):
         self.g_clean.setChecked(True)
         self.g_use_el = QCheckBox("Use electrodes")
         self.g_use_el.setChecked(True)
+        self.g_opening = _spin(0, 10, 1)
+        self.g_opening.setToolTip(
+            "Morphological opening before skeletonizing: removes structures thinner than\n"
+            "~2 x radius + 1 px. Use 0 when the wires are 1-2 px wide (downsampled SEM).")
+        self.g_closing = _spin(0, 10, 0)
+        self.g_closing.setToolTip(
+            "Morphological closing before skeletonizing: bridges small gaps so thin, noisy\n"
+            "wires stay continuous (SEM). Without it the network can fall apart into fragments.")
+        self.g_min_obj = _spin(0, 100000, 0)
+        self.g_min_obj.setToolTip("Remove isolated specks of up to this many pixels "
+                                  "(keeps thin wires, unlike the opening).")
+        f.addRow("Closing radius", self.g_closing)
+        f.addRow("Opening radius", self.g_opening)
+        f.addRow("Remove specks up to (px)", self.g_min_obj)
         f.addRow(self.g_clean)
         f.addRow(self.g_use_el)
         self.btn_extract = QPushButton("Extract graph")
@@ -807,12 +857,15 @@ class Pics2GraphWidget(QWidget):
             show_warning("No electrodes painted (both Vin and Vout are needed): "
                          "extracting the graph without electrodes.")
         clean = self.g_clean.isChecked()
+        opening_r, min_obj = self.g_opening.value(), self.g_min_obj.value()
+        closing_r = self.g_closing.value()
         raw_path = self.raw_path
 
         def job():
             SA = SkeletonAnalysis(img=binary)
             SA.original_img_path = raw_path
-            SA.img_cleaning()
+            SA.img_cleaning(opening_radius=opening_r, min_object_size=min_obj,
+                            closing_radius=closing_r)
             if masks is not None:
                 SA.load_electrodes(*masks)
             SA.skeletonize()

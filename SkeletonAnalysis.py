@@ -91,9 +91,33 @@ class SkeletonAnalysis:
 
         self.has_electrodes = True
 
-    def img_cleaning(self):
-        self.img = remove_small_holes(self.img.astype(bool), max_size=2)
-        self.img = opening(self.img, footprint=disk(1))
+    def img_cleaning(self, hole_size=2, opening_radius=1, min_object_size=0, closing_radius=0):
+        """
+        Morphological cleaning before skeletonization.
+
+        hole_size : fill holes of up to this many pixels inside the wires.
+        opening_radius : radius of the disk used for a morphological opening
+            (removes structures thinner than ~2 * radius + 1 px). Use 0 to skip
+            it when the wires are only 1-2 px wide (e.g. downsampled SEM
+            mosaics), otherwise it erases them.
+        min_object_size : remove connected objects of up to this many pixels
+            (an alternative way to remove noise that keeps thin wires).
+        closing_radius : radius of an elliptical morphological closing applied
+            first (0 = none). Bridges 1-2 px gaps so thin, noisy wires (e.g.
+            SEM) stay continuous; otherwise the skeleton breaks into fragments
+            and clean_network prunes most of the network.
+        """
+        img = self.img.astype(bool)
+        if closing_radius:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * closing_radius + 1,) * 2)
+            img = cv2.morphologyEx(img.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
+        if hole_size:
+            img = remove_small_holes(img, max_size=hole_size)
+        if opening_radius:
+            img = opening(img, footprint=disk(opening_radius))
+        if min_object_size:
+            img = remove_small_objects(img, max_size=min_object_size)
+        self.img = img
 
     def skeletonize(self):
         self.skeleton_img = skeletonize(self.img)
@@ -207,11 +231,13 @@ class SkeletonAnalysis:
             plt.savefig(save_path, bbox_inches='tight', pad_inches=0, dpi=400)
         plt.show()
 
-    def complete_analysis(self, clean_network=True, electrodes_path=None, save_graph_path=None, plot=False, save_plot_path=None, verbose=False):
+    def complete_analysis(self, clean_network=True, electrodes_path=None, save_graph_path=None, plot=False, save_plot_path=None, verbose=False,
+                          opening_radius=1, min_object_size=0, closing_radius=0):
         if verbose:
             print("Starting complete analysis...")
 
-        self.img_cleaning()
+        self.img_cleaning(opening_radius=opening_radius, min_object_size=min_object_size,
+                          closing_radius=closing_radius)
         if verbose:
             print("Image cleaned.")
 
