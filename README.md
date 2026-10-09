@@ -42,6 +42,8 @@ python gui.py                     # empty viewer
 python gui.py path/to/M5.tif      # open a micrograph directly
 ```
 
+On Windows you can also **double-click `pics2graph.bat`** (no need to open a terminal first), or drag an image onto it to open that image. It opens a terminal window that shows the loading progress and any error messages; if the program ends with an error, that window stays open until you press a key. To launch it from the Desktop, right-click `pics2graph.bat` › *Send to* › *Desktop (create shortcut)*.
+
 It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the right, one tab per stage:
 
 1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal).
