@@ -21,10 +21,22 @@ included by default. Fiji is located, in this order, from:
        ``C:/fiji-*/Fiji.app``, ``~/Downloads/fiji-*/Fiji.app``,
        ``/Applications/Fiji.app``, ...).
 
+Large tile sets (e.g. SEM)
+--------------------------
+ImageJ cannot hold a single image plane larger than 2^31 - 1 pixels (~2147
+Mpx), and the fusion needs the whole mosaic in memory. For big sets, reduce
+the tiles before stitching with ``downsample`` (an integer factor; each n x n
+block of pixels is averaged) and convert them to 8-bit gray with
+``tiles_to_gray``. ``stitch`` estimates the mosaic size beforehand and stops
+with a suggested factor if it cannot fit.
+
 Example
 -------
     from stitching import stitch
     mosaic_path = stitch("tiles/M4", output_path="M4/M4.tif")
+
+    # 180 SEM tiles of 8192 x 6144 px: reduce 4x and convert to 8-bit gray
+    stitch("tiles/SEM", downsample=4, tiles_to_gray=True)
 
     # Grid acquisition (snake by rows, 2 x 3 tiles, ~30 % overlap)
     stitch("tiles/M4", mode="grid", grid_type="snake-by-rows", order="right-down",
@@ -39,8 +51,10 @@ Command line
 
 import argparse
 import glob
+import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -83,6 +97,14 @@ COMPUTATION = {
     "time": "Save computation time (but use more RAM)",
     "memory": "Save memory (but be slower)",
 }
+# computation="auto" uses "memory" when the tiles add up to more than this:
+AUTO_MEMORY_BYTES = 2 * 1024 ** 3
+
+IMAGEJ_MAX_PIXELS = 2 ** 31 - 1     # largest image plane ImageJ can hold
+# Fraction of the summed tile area that ends up in the mosaic (assumes at least
+# ~10 % overlap in each direction). Used only for the size estimate.
+ASSUMED_COVERAGE = 0.8
+TEMP_PREFIX = "pics2graph_stitch_"
 
 
 # =============================================================================
@@ -191,7 +213,7 @@ def build_options(directory, output_directory, mode="unknown",
     if fusion_method not in FUSION_METHODS:
         raise ValueError(f"fusion_method must be one of {FUSION_METHODS}")
     if computation not in COMPUTATION:
-        raise ValueError(f"computation must be one of {tuple(COMPUTATION)}")
+        raise ValueError(f"computation must be one of {tuple(COMPUTATION)} (or 'auto' in stitch)")
 
     if mode == "unknown":
         opts = ["type=[Unknown position]", "order=[All files in directory]",
@@ -328,6 +350,130 @@ def _same_size_only(tiles):
 
 
 # =============================================================================
+#  Preparing the tiles (link / copy / reduce) and checking the mosaic size
+# =============================================================================
+def _palette_is_gray(im):
+    """
+    True if a palette ('P') image only *uses* gray colors (R == G == B).
+    Unused entries are ignored: SEM software (e.g. Zeiss) reserves a few
+    colored entries for annotations that most images never use.
+    """
+    pal = im.getpalette() or []
+    counts = im.histogram()
+    for i, n in enumerate(counts):
+        if n and 3 * i + 2 < len(pal) and not (pal[3 * i] == pal[3 * i + 1] == pal[3 * i + 2]):
+            return False
+    return True
+
+
+def _tile_info(path):
+    """(width, height, channels, bytes_per_channel, PIL mode) of an image file."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(path) as im:
+        mode = im.mode
+        w, h = im.size
+        if mode == "P":
+            mode = "P-gray" if _palette_is_gray(im) else "P"
+    channels = {"RGB": 3, "RGBA": 4, "CMYK": 4, "LA": 2, "P": 3}.get(mode, 1)
+    depth = 2 if mode.startswith("I;16") or mode == "I" else (4 if mode == "F" else 1)
+    return w, h, channels, depth, mode
+
+
+def _needs_rewrite(info, downsample, tiles_to_gray):
+    """Whether the tiles must be rewritten (reduced / converted) for Fiji."""
+    w, h, channels, depth, mode = info
+    return (downsample > 1 or mode.startswith("P")
+            or (tiles_to_gray and (channels > 1 or depth > 1)))
+
+
+def _prepare_tile(src, dst, downsample, tiles_to_gray):
+    """Write ``src`` to ``dst`` reduced by ``downsample`` and/or in 8-bit gray."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(src) as im:
+        if im.mode == "P":                      # palette (e.g. SEM): expand the LUT
+            im = im.convert("L" if tiles_to_gray or _palette_is_gray(im) else "RGB")
+        if tiles_to_gray and im.mode != "L":
+            if im.mode.startswith("I") or im.mode == "F":
+                import numpy as np
+                a = np.asarray(im, dtype=np.float64)
+                lo, hi = np.percentile(a, (0.01, 99.99))
+                a = np.clip((a - lo) * (255.0 / max(hi - lo, 1e-12)), 0, 255)
+                im = Image.fromarray(a.astype(np.uint8))
+            else:
+                im = im.convert("L")
+        if downsample > 1:
+            im = im.reduce(int(downsample))     # mean of each n x n block
+        ext = os.path.splitext(dst)[1].lower()
+        if ext in (".jpg", ".jpeg"):
+            im.save(dst, quality=95)
+        else:
+            im.save(dst)
+
+
+def _link_or_copy(src, dst):
+    """Hard-link ``src`` to ``dst`` (no extra disk space); copy if not possible."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _scale_layout(src, dst, factor):
+    """Copy a TileConfiguration file dividing its coordinates by ``factor``."""
+    number = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
+    pattern = re.compile(r"\(\s*(" + number + r")\s*,\s*(" + number + r")\s*(?:,\s*(" + number + r"))?\s*\)")
+
+    def scale(m):
+        vals = [float(v) / factor for v in m.groups() if v is not None]
+        return "(" + ", ".join(repr(v) for v in vals) + ")"
+
+    with open(src, encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    with open(dst, "w", encoding="utf-8") as fh:
+        for line in lines:
+            if ";" in line and not line.lstrip().startswith("#"):
+                line = pattern.sub(scale, line)
+            fh.write(line)
+
+
+def estimate_mosaic(tiles, downsample=1, tiles_to_gray=False):
+    """
+    Rough size of the mosaic that ``stitch`` would produce.
+
+    Returns a dict with the size of one prepared tile, the estimated mosaic
+    pixels (summed tile area x ``ASSUMED_COVERAGE``), the bytes of all tiles,
+    and the smallest ``downsample`` that keeps the mosaic under ImageJ's limit.
+    """
+    w, h, channels, depth, mode = _tile_info(tiles[0])
+    if tiles_to_gray:
+        channels, depth = 1, 1
+    tw, th = w // downsample, h // downsample
+    tile_px = tw * th
+    mosaic_px = len(tiles) * tile_px * ASSUMED_COVERAGE
+    full_px = len(tiles) * w * h * ASSUMED_COVERAGE
+    min_factor = max(1, math.ceil(math.sqrt(full_px / IMAGEJ_MAX_PIXELS)))
+    comfortable = max(1, math.ceil(math.sqrt(full_px / 600e6)))   # ~0.6 Gpx
+    return dict(tile_size=(tw, th), channels=channels, bytes_per_channel=depth,
+                mosaic_pixels=mosaic_px,
+                mosaic_bytes=mosaic_px * channels * depth,
+                tiles_bytes=len(tiles) * tile_px * channels * depth,
+                min_downsample=min_factor, suggested_downsample=comfortable)
+
+
+def _cleanup_stale_temp(max_age_hours=6):
+    """Remove working folders left by interrupted runs (older than a few hours)."""
+    now = time.time()
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), TEMP_PREFIX + "*")):
+        try:
+            if os.path.isdir(d) and now - os.path.getmtime(d) > max_age_hours * 3600:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
+# =============================================================================
 #  Main function
 # =============================================================================
 def stitch(tiles_dir, output_path=None, mode="unknown", pattern="*", tiles=None,
@@ -336,15 +482,18 @@ def stitch(tiles_dir, output_path=None, mode="unknown", pattern="*", tiles=None,
            layout_file=None, fusion_method="Linear Blending",
            regression_threshold=0.30, max_avg_displacement_threshold=2.50,
            absolute_displacement_threshold=3.50, compute_overlap=True,
-           subpixel_accuracy=True, computation="time", extra_options="",
-           grayscale=False, fiji_path=None, memory=None, timeout=None,
-           keep_temp=False, verbose=True):
+           subpixel_accuracy=True, computation="auto", extra_options="",
+           grayscale=False, downsample=1, tiles_to_gray=False, check_size=True,
+           fiji_path=None, memory=None, timeout=None, keep_temp=False,
+           verbose=True):
     """
     Stitch the tiles in ``tiles_dir`` with Fiji and save the fused mosaic.
 
-    The tiles are copied to a temporary folder before running Fiji, so the
-    original folder is not modified (the plugin writes its TileConfiguration
-    files next to the tiles) and non-image files are ignored.
+    The tiles are placed in a temporary folder before running Fiji (hard
+    links when possible, so no extra disk space; reduced copies when
+    ``downsample`` or ``tiles_to_gray`` apply), so the original folder is not
+    modified (the plugin writes its TileConfiguration files next to the tiles)
+    and non-image files are ignored.
 
     Parameters
     ----------
@@ -389,13 +538,25 @@ def stitch(tiles_dir, output_path=None, mode="unknown", pattern="*", tiles=None,
         In grid/positions modes, refine the positions by phase correlation.
     subpixel_accuracy : bool
         Subpixel registration.
-    computation : {"time", "memory"}
-        Trade-off between speed and RAM.
+    computation : {"auto", "time", "memory"}
+        Trade-off between speed and RAM. "auto" uses "memory" when the tiles
+        add up to more than 2 GB.
     extra_options : str
         Extra options appended verbatim to the plugin call (for anything not
         covered above; record it with Fiji's macro recorder).
     grayscale : bool
         Save the mosaic in grayscale instead of color.
+    downsample : int
+        Reduce each tile by this factor before stitching (each n x n block of
+        pixels is averaged). The mosaic shrinks by n^2 in pixels and memory;
+        the registered positions refer to the reduced tiles.
+    tiles_to_gray : bool
+        Convert the tiles to 8-bit grayscale before stitching (3x less memory
+        for color tiles, 2x for 16-bit). Palette images (common in SEM) are
+        always expanded through their lookup table.
+    check_size : bool
+        Estimate the mosaic size first and stop with a suggested ``downsample``
+        if it exceeds what ImageJ can hold.
     fiji_path : str, optional
         Fiji.app folder or launcher. See ``find_fiji``.
     memory : str, optional
@@ -411,7 +572,6 @@ def stitch(tiles_dir, output_path=None, mode="unknown", pattern="*", tiles=None,
     -------
     str : path of the saved mosaic.
     """
-    fiji = find_fiji(fiji_path)
     if output_path is None:
         output_path = os.path.join(tiles_dir, "Fused.tif")
     output_path = os.path.abspath(output_path)
@@ -420,19 +580,54 @@ def stitch(tiles_dir, output_path=None, mode="unknown", pattern="*", tiles=None,
         tiles = list_tiles(tiles_dir, pattern, exclude=(output_path,))
     if len(tiles) < 2:
         raise ValueError(f"At least 2 tiles are needed; found {len(tiles)} in {tiles_dir}.")
+    downsample = int(downsample)
+    if downsample < 1:
+        raise ValueError("downsample must be an integer >= 1")
 
-    work = tempfile.mkdtemp(prefix="pics2graph_stitch_")
+    est = estimate_mosaic(tiles, downsample, tiles_to_gray)
+    if verbose:
+        tw, th = est["tile_size"]
+        print(f"{len(tiles)} tiles of {tw} x {th} px"
+              f"{' (after reducing ' + str(downsample) + 'x)' if downsample > 1 else ''}; "
+              f"estimated mosaic ~{est['mosaic_pixels'] / 1e6:,.0f} Mpx "
+              f"(~{est['mosaic_bytes'] / 1024 ** 3:.1f} GB).")
+    if check_size and est["mosaic_pixels"] > IMAGEJ_MAX_PIXELS:
+        raise ValueError(
+            f"The mosaic would have ~{est['mosaic_pixels'] / 1e6:,.0f} Mpx, more than "
+            f"ImageJ can hold in one image ({IMAGEJ_MAX_PIXELS / 1e6:,.0f} Mpx). Reduce the "
+            f"tiles with downsample={max(est['min_downsample'], downsample + 1)} or more "
+            f"(downsample={est['suggested_downsample']} keeps the later analysis "
+            f"comfortable on ~16 GB of RAM), and consider tiles_to_gray=True. "
+            f"Use check_size=False to try anyway.")
+    fiji = find_fiji(fiji_path)
+    if computation == "auto":
+        computation = "memory" if est["tiles_bytes"] > AUTO_MEMORY_BYTES else "time"
+        if verbose and computation == "memory":
+            print("Large tile set: using Fiji's low-memory mode (slower).")
+
+    _cleanup_stale_temp()
+    work = tempfile.mkdtemp(prefix=TEMP_PREFIX)
     in_dir = os.path.join(work, "tiles")
     out_dir = os.path.join(work, "fused")
     os.makedirs(in_dir)
     os.makedirs(out_dir)
     try:
-        for t in tiles:
-            shutil.copy2(t, in_dir)
+        rewrite = _needs_rewrite(_tile_info(tiles[0]), downsample, tiles_to_gray)
+        t_prep = time.time()
+        for i, t in enumerate(tiles, 1):
+            dst = os.path.join(in_dir, os.path.basename(t))
+            if rewrite:
+                _prepare_tile(t, dst, downsample, tiles_to_gray)
+            else:
+                _link_or_copy(t, dst)
+            if verbose and rewrite and (i % 10 == 0 or i == len(tiles)):
+                print(f"Preparing tiles: {i}/{len(tiles)} ({time.time() - t_prep:.0f} s)",
+                      flush=True)
         if mode == "positions":
             if layout_file is None:
                 layout_file = os.path.join(tiles_dir, "TileConfiguration.txt")
-            shutil.copy2(layout_file, in_dir)
+            _scale_layout(layout_file, os.path.join(in_dir, os.path.basename(layout_file)),
+                          downsample)
 
         options = build_options(
             in_dir, out_dir, mode=mode, grid_type=grid_type, order=order,
@@ -526,9 +721,15 @@ def _parse_args():
     p.add_argument("--absolute-displacement", type=float, default=3.50)
     p.add_argument("--no-compute-overlap", action="store_true")
     p.add_argument("--no-subpixel", action="store_true")
-    p.add_argument("--computation", choices=tuple(COMPUTATION), default="time")
+    p.add_argument("--computation", choices=("auto",) + tuple(COMPUTATION), default="auto")
     p.add_argument("--extra-options", default="", help="Extra plugin options, verbatim.")
     p.add_argument("--grayscale", action="store_true", help="Save the mosaic in grayscale.")
+    p.add_argument("--downsample", type=int, default=1,
+                   help="Reduce each tile by this integer factor before stitching.")
+    p.add_argument("--tiles-to-gray", action="store_true",
+                   help="Convert the tiles to 8-bit gray before stitching.")
+    p.add_argument("--no-size-check", action="store_true",
+                   help="Do not stop when the estimated mosaic is too large.")
     p.add_argument("--memory", default=None, help="Java heap for Fiji, e.g. 8g.")
     p.add_argument("--timeout", type=float, default=None)
     p.add_argument("--keep-temp", action="store_true")
@@ -549,6 +750,8 @@ def stitch_from_args(args):
         compute_overlap=not args.no_compute_overlap,
         subpixel_accuracy=not args.no_subpixel, computation=args.computation,
         extra_options=args.extra_options, grayscale=args.grayscale,
+        downsample=args.downsample, tiles_to_gray=args.tiles_to_gray,
+        check_size=not args.no_size_check,
         fiji_path=args.fiji, memory=args.memory, timeout=args.timeout,
         keep_temp=args.keep_temp, verbose=not args.quiet)
 

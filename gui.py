@@ -238,7 +238,9 @@ class Pics2GraphWidget(QWidget):
 
     def _run(self, fn, on_done, button, busy_msg):
         """Run ``fn`` in a background thread, then ``on_done(result)`` in the GUI."""
-        worker = thread_worker(fn)()
+        # ignore_errors: errors are shown by _errored below instead of being
+        # re-raised in the GUI thread (which would close the whole program)
+        worker = thread_worker(fn, ignore_errors=True)()
         button.setEnabled(False)
         self.status.setText(busy_msg)
 
@@ -349,7 +351,8 @@ class Pics2GraphWidget(QWidget):
         self.st_compute_overlap.setChecked(True)
         self.st_subpixel = QCheckBox("Subpixel accuracy")
         self.st_subpixel.setChecked(True)
-        self.st_computation = _combo(st.COMPUTATION, "time")
+        self.st_computation = _combo(("auto",) + tuple(st.COMPUTATION), "auto")
+        self.st_computation.setToolTip("auto: low-memory mode when the tiles add up to more than 2 GB")
         self.st_extra = QLineEdit()
         self.st_extra.setPlaceholderText("extra plugin options (verbatim)")
         f.addRow("Fusion", self.st_fusion)
@@ -359,6 +362,14 @@ class Pics2GraphWidget(QWidget):
         f.addRow(self.st_compute_overlap)
         f.addRow(self.st_subpixel)
         f.addRow("Optimize for", self.st_computation)
+        self.st_downsample = _spin(1, 32, 1)
+        self.st_downsample.setToolTip(
+            "Reduce each tile by this factor before stitching (n x n pixels are averaged).\n"
+            "Needed for large sets: ImageJ cannot hold a mosaic over ~2150 Mpx.")
+        f.addRow("Downsample tiles", self.st_downsample)
+        self.st_gray = QCheckBox("Convert tiles to 8-bit gray")
+        self.st_gray.setToolTip("3x less memory for color tiles, 2x for 16-bit (e.g. SEM).")
+        f.addRow(self.st_gray)
         f.addRow("Extra options", self.st_extra)
 
         row, self.st_fiji = self._path_row("dir", placeholder="Fiji.app folder")
@@ -374,9 +385,17 @@ class Pics2GraphWidget(QWidget):
             "save", "TIFF (*.tif)", placeholder="default: <tiles>/Fused.tif")
         f.addRow("Output", row)
 
+        btn_check = QPushButton("Check size")
+        btn_check.setToolTip("Estimate the mosaic size with the current settings, without running Fiji.")
+        btn_check.clicked.connect(self.check_stitch_size)
         self.btn_stitch = QPushButton("Stitch")
         self.btn_stitch.clicked.connect(self.stitch)
-        f.addRow(self.btn_stitch)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(btn_check)
+        rl.addWidget(self.btn_stitch)
+        f.addRow(row)
         lay.addWidget(box)
         lay.addStretch()
 
@@ -423,6 +442,33 @@ class Pics2GraphWidget(QWidget):
             self.viewer.reset_view()
         self._say(f"Opened binary image {os.path.basename(path)}. Next: 3. Electrodes or 4. Graph.")
 
+    def check_stitch_size(self):
+        tiles_dir = self.st_tiles.text().strip()
+        if not tiles_dir or not os.path.isdir(tiles_dir):
+            self._say("Choose the folder with the tiles.", "warning")
+            return
+        out = self.st_output.text().strip() or os.path.join(tiles_dir, "Fused.tif")
+        tiles = st.list_tiles(tiles_dir, self.st_pattern.text().strip() or "*",
+                              exclude=(os.path.abspath(out),))
+        if len(tiles) < 2:
+            self._say(f"Found {len(tiles)} tiles in that folder.", "warning")
+            return
+        ds = self.st_downsample.value()
+        e = st.estimate_mosaic(tiles, ds, self.st_gray.isChecked())
+        tw, th = e["tile_size"]
+        ok = e["mosaic_pixels"] <= st.IMAGEJ_MAX_PIXELS
+        msg = (f"{len(tiles)} tiles of {tw} x {th} px -> mosaic ~{e['mosaic_pixels'] / 1e6:,.0f} Mpx "
+               f"(~{e['mosaic_bytes'] / 1024 ** 3:.1f} GB). ")
+        if not ok:
+            msg += (f"Too large for ImageJ: use downsample >= {e['min_downsample']} "
+                    f"(suggested {e['suggested_downsample']}).")
+        elif ds < e["suggested_downsample"]:
+            msg += (f"Fits in ImageJ; downsample {e['suggested_downsample']} would keep "
+                    "binarization and graph extraction comfortable on ~16 GB of RAM.")
+        else:
+            msg += "OK."
+        self._say(msg, "info" if ok else "warning")
+
     def stitch(self):
         tiles = self.st_tiles.text().strip()
         if not tiles or not os.path.isdir(tiles):
@@ -439,6 +485,8 @@ class Pics2GraphWidget(QWidget):
             compute_overlap=self.st_compute_overlap.isChecked(),
             subpixel_accuracy=self.st_subpixel.isChecked(),
             computation=self.st_computation.currentText(),
+            downsample=self.st_downsample.value(),
+            tiles_to_gray=self.st_gray.isChecked(),
             extra_options=self.st_extra.text().strip(),
             fiji_path=self.st_fiji.text().strip() or None,
             memory=self.st_memory.text().strip() or None,

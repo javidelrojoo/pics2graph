@@ -73,6 +73,10 @@ def parse_args():
                    help="'unknown': the plugin finds the arrangement (default); "
                         "'positions': use <TILES_DIR>/TileConfiguration.txt.")
     s.add_argument("--fiji-memory", default=None, help="Java heap for Fiji, e.g. 8g.")
+    s.add_argument("--stitch-downsample", type=int, default=1,
+                   help="Reduce each tile by this factor before stitching (large sets, e.g. SEM).")
+    s.add_argument("--stitch-gray", action="store_true",
+                   help="Convert the tiles to 8-bit gray before stitching.")
 
     b = p.add_argument_group("binarization (only with --binarize)")
     b.add_argument("--binarize", action="store_true",
@@ -98,7 +102,9 @@ def main():
         using_default = False
         mosaic = None if args.image == IMG_PATH else args.image
         img_path = stitch(args.stitch, output_path=mosaic, mode=args.stitch_mode,
-                          fiji_path=args.fiji, memory=args.fiji_memory, verbose=verbose)
+                          fiji_path=args.fiji, memory=args.fiji_memory,
+                          downsample=args.stitch_downsample, tiles_to_gray=args.stitch_gray,
+                          verbose=verbose)
         args.binarize = True
 
     if args.binarize:

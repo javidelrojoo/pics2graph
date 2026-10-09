@@ -89,6 +89,7 @@ Main options (`python main.py -h` lists them all):
 | `--no-clean` | Do not prune degree-1 nodes nor collapse degree-2 nodes. |
 | `--stitch TILES_DIR` | Stitch the tiles in that folder with Fiji first (implies `--binarize`). |
 | `--fiji`, `--stitch-mode {unknown,positions}`, `--fiji-memory` | Fiji location, stitching mode and Java memory. |
+| `--stitch-downsample N`, `--stitch-gray` | Reduce the tiles N times / convert them to 8-bit gray before stitching (large sets). |
 | `--binarize`, `--block-size`, `--C`, `--threshold` | Prior adaptive binarization and its parameters. |
 | `--plot`, `--save-plot` | Show / save the graph over the image. |
 
@@ -107,8 +108,21 @@ python stitching.py path/M5_tiles --mode grid --grid-type snake-by-rows --order 
 # Approximate positions from a TileConfiguration file
 python stitching.py path/M5_tiles --mode positions --layout-file path/M5_tiles/TileConfiguration.txt
 
+# Large sets (e.g. 180 SEM tiles of 8192 x 6144 px): reduce 4x and convert to 8-bit gray
+python stitching.py path/SEM_tiles --downsample 4 --tiles-to-gray
+
 python stitching.py -h      # all options
 ```
+
+**Large tile sets.** ImageJ cannot hold an image larger than 2^31 − 1 pixels (~2150 Mpx), and the fusion needs the whole mosaic in memory, so very large sets fail with *Out of memory* no matter how much RAM is available. `stitch` estimates the mosaic size before running Fiji and stops with a suggested factor if it cannot fit. Use:
+
+* `downsample=n`: each tile is reduced n times (each n × n block of pixels is averaged) before stitching, so the mosaic has n² times fewer pixels. Check that the wires stay visible: in SEM images with 4–6 px wide wires, `downsample=4` still resolves them (1–2 px).
+* `tiles_to_gray=True`: 8-bit grayscale tiles (3× less memory than color, 2× less than 16-bit). Palette images whose used colors are all gray (typical of SEM, e.g. Zeiss) are always converted to gray.
+* `computation="auto"` (default): switches to Fiji's low-memory mode when the tiles add up to more than 2 GB.
+
+As a reference, for 180 tiles of 8192 × 6144 px: full resolution ~7250 Mpx (does not fit), `downsample=2` ~1800 Mpx (fits, but the later binarization and graph extraction are heavy), `downsample=4` ~450 Mpx (comfortable on 16 GB of RAM). In the GUI, the *Check size* button gives this estimate for the current settings.
+
+When the tiles need no changes they are hard-linked instead of copied (no extra disk space); working folders left by interrupted runs are removed automatically after a few hours.
 
 From Python:
 
@@ -123,7 +137,9 @@ mosaic = stitch("path/M5_tiles", output_path="path/M5.tif",
 * **`stitch(tiles_dir, output_path=None, mode="unknown", ...)`**: runs the plugin and saves the mosaic (default `<tiles_dir>/Fused.tif`) plus the registered positions (`<name>_TileConfiguration.registered.txt`). Returns the mosaic path.
   * `mode`: `"unknown"` (*Unknown position*), `"grid"` (*Grid: row-by-row / column-by-column / snake by rows / snake by columns*, with `grid_type`, `order`, `grid_size`, `tile_overlap`, `file_names`, `first_index`) or `"positions"` (*Positions from file*, with `layout_file`).
   * Plugin parameters: `fusion_method`, `regression_threshold`, `max_avg_displacement_threshold`, `absolute_displacement_threshold`, `compute_overlap`, `subpixel_accuracy`, `computation` (`"time"` / `"memory"`). Anything else can be passed verbatim with `extra_options` (copy it from Fiji's macro recorder).
+  * Large sets: `downsample`, `tiles_to_gray`, `check_size` (see above).
   * Other: `pattern` / `tiles` to choose the tiles, `grayscale`, `fiji_path`, `memory` (Java heap, e.g. `"8g"`), `timeout`, `keep_temp`, `verbose`.
+* **`estimate_mosaic(tiles, downsample=1, tiles_to_gray=False)`**: estimated mosaic size and the smallest/suggested `downsample`, without running Fiji.
 * **`find_fiji(fiji_path=None)`**: locates the Fiji launcher.
 * **`build_options(...)` / `build_macro(...)`**: the option string and macro passed to Fiji (useful to inspect what will be run).
 
