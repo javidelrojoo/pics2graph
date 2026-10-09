@@ -25,9 +25,19 @@ first time after installing or rebooting) are loaded afterwards, reporting each
 step both in that window and in the terminal.
 """
 
+import importlib.util
 import os
 import sys
 import time
+
+# Prefer Qt6 (PyQt6 / PySide6) when installed, even if PyQt5 is also present:
+# qtpy would pick PyQt5 first, and napari's PyQt5 support is deprecated.
+# Set the QT_API environment variable to override this choice.
+if "QT_API" not in os.environ:
+    for _api, _module in (("pyqt6", "PyQt6"), ("pyside6", "PySide6")):
+        if importlib.util.find_spec(_module) is not None:
+            os.environ["QT_API"] = _api
+            break
 
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QColor, QFont, QPainter, QPixmap
