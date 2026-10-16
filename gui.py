@@ -103,6 +103,9 @@ VIN, VOUT = 1, 2            # label values in the electrodes layer
 # regions. Treat them as starting points and check the result visually.
 PRESETS = {
     "Optical dark-field (default)": (151, 15, 55, 1, 0, 0),
+    # Dense dark-field networks with 1-2 px wide wires (e.g. JTA_Ag_I1): a small
+    # window and negative C separate the wires from the halo around them.
+    "Optical dark-field, dense / thin wires": (31, -8, 0, 0, 1, 10),
     "SEM, tiles downsampled 4x": (21, -11, 0, 0, 1, 10),
     "SEM, tiles downsampled 2x": (61, -23, 0, 0, 2, 10),
 }

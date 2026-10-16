@@ -103,6 +103,7 @@ Starting points for SEM images of AgNW networks (Zeiss, 8192 × 6144 px tiles, w
 | Preset | block size | C | intensity threshold | closing radius | opening radius | remove specks (px) |
 | --- | --- | --- | --- | --- | --- | --- |
 | Optical dark-field (default) | 151 | 15 | 55 | 0 | 1 | 0 |
+| Optical dark-field, dense / thin wires | 31 | −8 | 0 | 1 | 0 | 10 |
 | SEM, tiles downsampled 4× | 21 | −11 | 0 | 1 | 0 | 10 |
 | SEM, tiles downsampled 2× | 61 | −23 | 0 | 2 | 0 | 10 |
 
@@ -110,6 +111,7 @@ From the command line: `--block-size 61 --C -23 --threshold 0 --closing-radius 2
 
 How they were chosen and what to keep in mind:
 
+* **Dense dark-field networks** (wires 1–2 px wide, bright clumps): the default preset also marks the halo around wires and crossings, merging neighboring wires into blobs, and its opening cuts the network apart. The *dense / thin wires* preset was chosen by visually comparing the skeleton with the image and by the connectivity of the cleaned network; adjust C between −6 (more continuous, more false contacts) and −10 (better separated, more fragmented). Bright clumps of overlapping wires cannot be resolved at this resolution.
 * **Negative C** keeps only pixels clearly brighter than their surroundings.
 * **No opening for thin wires.** The opening (radius 1) removes structures thinner than 3 px: on SEM mosaics downsampled 4× (wires 1–2 px) it erased 85–90 % of the wires, and 25–30 % at 2×.
 * **A closing is needed.** In some regions the SEM shows the wires with bright edges and a darker core; the threshold then breaks them into fragments, and since `clean_network` prunes everything that is not part of a cycle, the graph falls apart (a binarization with 98 % pixel agreement gave 6 nodes instead of ~4000). A closing of radius 1–2 bridges those gaps.
