@@ -58,7 +58,7 @@ def _load_modules(report=print):
     each step so the user can see that the program is loading, not frozen.
     """
     global _LOADED, cv2, np, napari, thread_worker, show_error, show_info, show_warning
-    global pre, st, SkeletonAnalysis
+    global pre, st, er, SkeletonAnalysis
     global get_line_graph_positions, get_node_positions
     global plot_line_graph_on_image, plot_network_on_image
     if _LOADED:
@@ -81,6 +81,7 @@ def _load_modules(report=print):
     import matplotlib
     matplotlib.use("Agg")       # figures are only saved to disk, never shown
     import stitching as st
+    import electrode_registration as er
     from visualization import (get_line_graph_positions, get_node_positions,
                                plot_line_graph_on_image, plot_network_on_image)
     _LOADED = True
@@ -89,6 +90,7 @@ def _load_modules(report=print):
 RAW = "micrograph"
 BINARY = "binary"
 ELECTRODES = "electrodes"
+PHOTO = "electrode photo (aligned)"
 SKELETON = "skeleton"
 EDGES = "graph edges"
 NODES = "graph nodes"
@@ -680,6 +682,36 @@ class Pics2GraphWidget(QWidget):
         v.addLayout(row)
         lay.addWidget(box)
 
+        box = QGroupBox("From a later photo")
+        f = QFormLayout(box)
+        help_ = QLabel(
+            "Use a photo taken after depositing the electrodes (it may have another "
+            "magnification, rotation and position). It is aligned with the open "
+            "micrograph by matching the wire network, and the two electrodes found "
+            "in it are transferred here (left/top = Vin, right/bottom = Vout).")
+        help_.setWordWrap(True)
+        f.addRow(help_)
+        row, self.el_photo = self._path_row("open", placeholder="photo with the electrodes")
+        f.addRow("Photo", row)
+        self.el_scale = _dspin(0, 20, 0, 0.5, 2)
+        self.el_scale.setSpecialValueText("auto")
+        self.el_scale.setToolTip("Image pixels per photo pixel, e.g. 2 for a 5x photo on a 10x "
+                                 "mosaic. 'auto' tries several scales (slower).")
+        f.addRow("Scale", self.el_scale)
+        self.el_feature = _combo(("auto", "warm", "bright", "dark"))
+        self.el_feature.setToolTip(
+            "How the electrodes differ from the bare network in the photo:\n"
+            "warm = more reddish, bright = brighter, dark = darker, auto = best separating.")
+        f.addRow("Electrodes look", self.el_feature)
+        self.el_sigma = _spin(1, 200, 15)
+        self.el_sigma.setToolTip("Smoothing (photo px) before detecting the electrodes; "
+                                 "larger than the spacing between wires.")
+        f.addRow("Smoothing", self.el_sigma)
+        self.btn_el_photo = QPushButton("Align photo && detect electrodes")
+        self.btn_el_photo.clicked.connect(self.electrodes_from_photo)
+        f.addRow(self.btn_el_photo)
+        lay.addWidget(box)
+
         box = QGroupBox("Load / save masks")
         f = QFormLayout(box)
         row, self.el_vin = self._path_row("open", placeholder="Vin mask")
@@ -752,6 +784,58 @@ class Pics2GraphWidget(QWidget):
         data[m2] = VOUT
         layer.data = data
         self._say("Electrode masks loaded.")
+
+    def electrodes_from_photo(self):
+        path = self.el_photo.text().strip()
+        if not path or not os.path.isfile(path):
+            self._say("Choose the photo that shows the electrodes.", "warning")
+            return
+        if self.raw_gray is None:
+            self._say("Open the micrograph of the network first (tab 1): the alignment "
+                      "needs the image itself, not only the binary one.", "warning")
+            return
+        image = self.raw_gray
+        scale = self.el_scale.value() or None
+        feature = self.el_feature.currentText()
+        sigma = self.el_sigma.value()
+
+        def job():
+            photo = er.imread(path, cv2.IMREAD_COLOR)
+            m1, m2, info = er.electrodes_from_photo(image, photo, scale=scale,
+                                                    feature=feature, sigma=sigma)
+            return m1, m2, info, er.warp_photo(photo, info["M"], image.shape)
+
+        self._run(job, self._photo_done, self.btn_el_photo,
+                  "Aligning the photo with the image (can take ~30 s, longer with 'auto' scale)...")
+
+    def _photo_done(self, result):
+        m1, m2, info, warped = result
+        layer = self._electrodes_layer()
+        if layer is None:
+            return
+        if layer.data.shape != m1.shape:
+            self._say(f"The electrode layer {layer.data.shape} does not match the micrograph "
+                      f"{m1.shape}; clear it ('Create / clear electrode layer') and retry.", "error")
+            return
+        data = np.zeros(m1.shape, np.uint8)
+        data[m1] = VIN
+        data[m2] = VOUT
+        layer.data = data
+        self._remove(PHOTO)
+        self.viewer.add_image(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB), name=PHOTO, rgb=True,
+                              opacity=0.5)
+        if RAW in self.viewer.layers:
+            self.viewer.layers.move(self.viewer.layers.index(PHOTO),
+                                    self.viewer.layers.index(RAW) + 1)
+        self.viewer.layers.selection.active = layer
+        msg = (f"Photo aligned: scale {info['scale']:.3f}, rotation {info['rotation_deg']:.2f} deg, "
+               f"{info['inliers']} matching points, residual {info['residual_median']:.2f} px. "
+               f"Electrodes detected by '{info['detect_feature']}' ({info['detect_layout']}). "
+               f"Check them against the '{PHOTO}' layer, touch them up with the tools above, "
+               "then 'Save masks...'.")
+        if info["warnings"]:
+            msg += " Note: " + " ".join(info["warnings"])
+        self._say(msg, "warning" if info["warnings"] else "info")
 
     def electrode_masks(self):
         """(Vin, Vout) masks as uint8 0/255, or None if nothing was painted."""

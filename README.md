@@ -14,6 +14,7 @@ tiles ──(stitching, Fiji)──► raw image ──(preprocessing)──► 
 
 | File | Role |
 | --- | --- |
+| `electrode_registration.py` | Finds the electrodes of a later photo (other magnification/rotation) on the existing image and turns them into electrode masks. |
 | `stitching.py` | Stitches overlapping tiles into one mosaic by running Fiji's *Grid/Collection stitching* plugin headless. |
 | `preprocessing.py` | Adaptive binarization of the photomicrograph. |
 | `SkeletonAnalysis.py` | Morphological cleaning, skeletonization, graph extraction and pruning, line graph and export. |
@@ -48,7 +49,7 @@ It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the 
 
 1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal).
 2. **Binarize**: adaptive binarization with live preview while you move *block size*, *C* and the intensity threshold. The result is an editable `binary` layer: select it and use napari's brush (label 1) to add wire pixels or the eraser to remove them. *Save binary image...* exports it.
-3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, or load existing masks. *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
+3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, load existing masks, or get them **from a later photo** (see *Electrodes from a later photo*). *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
 4. **Graph**: extract the graph (optional cleaning and electrodes), view the spatial graph G or the line graph L over the image with zoom, and export the `.graphml`, a figure or a screenshot.
 
 Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
@@ -118,6 +119,30 @@ How they were chosen and what to keep in mind:
 * The values were chosen by comparing the resulting **graph** (number of nodes after cleaning) with the graph of a reference segmentation made at full resolution and reduced to the same scale, on tiles from a dark and a bright region: 0.76–0.99 of the reference nodes at 4×, 0.98–1.03 at 2×.
 * **Resolution changes the topology in dense regions.** Compared with the full-resolution reference, the graph at 4× had about the same number of nodes in a sparse region but ~3× more in a dense region with many nearly parallel wires (they touch at low resolution and create spurious junctions); at 2× it was 1.2–1.9×. For quantitative results in dense areas, analyze at the highest resolution you can, e.g. by regions.
 * The graph is very sensitive to these settings: always check the binary layer and the graph visually before trusting the numbers.
+
+## Electrodes from a later photo (`electrode_registration.py`)
+
+Typical case: the network is mapped first (e.g. a 10× mosaic) and the electrodes are deposited afterwards; a new photo shows them, usually at another magnification (e.g. 5×), slightly rotated and shifted. This module transfers them to the mosaic:
+
+1. **Registration**: the same features of the wire network are found in both images (SIFT) and the similarity transform (scale + rotation + translation) from the photo to the image is fitted with RANSAC. The scale can be given or searched automatically.
+2. **Detection**: the two electrodes are found in the photo by a smoothed feature (`warm` = red minus blue, `bright`, `dark`, or `auto`, which picks the one that best separates two classes); the two largest regions are kept, ordered left→right (or top→bottom): the first is Vin, the second Vout.
+3. **Transfer**: both masks are warped to the image coordinates.
+
+```bash
+# writes JTA_Ag_O3_electrode_mask1.tif (Vin), _mask2.tif (Vout) and _electrode_check.jpg next to the image
+python electrode_registration.py JTA_Ag_O3.tif JTA_Ag_O3_electrodes.JPG --scale 2
+python electrode_registration.py -h
+```
+
+In the GUI (tab 3, *From a later photo*): choose the photo, the scale (image px per photo px, e.g. 2 for a 5× photo on a 10× mosaic, or *auto*) and how the electrodes look, then *Align photo & detect electrodes*. The electrodes layer is filled and the aligned photo is added as a semi-transparent layer to check them; touch them up with the drawing tools and *Save masks...*.
+
+From Python: `electrodes_from_photo(image, photo, scale=None, feature="auto", sigma=15)` returns `(mask1, mask2, info)`; `info` holds the transform `M`, `scale`, `rotation_deg`, the number of consistent matches, the residual and warnings. Lower-level pieces: `register`, `detect_electrodes`, `warp_mask`, `warp_photo`, `check_image`.
+
+Notes:
+
+* The registration needs the photo to show the same network (a few hundred consistent matches are typical; at least 25 are required). On JTA_Ag_O3 (5× photo on a 10× mosaic) it found scale 1.987 and rotation −2.37° from ~2500 matches, with a median residual of 0.56 px; in synthetic tests it recovered any rotation and magnification ratios up to 5× within ~1 px.
+* The detection is a starting point. If an electrode touches the border of the photo you get a warning: it may continue outside the photo, or the detection may include some bare network there. Always check the edges facing the gap, which define the contacts.
+* Under dark field the same wire can look brighter or dimmer depending on its orientation and the illumination, so the photo and the mosaic do not show exactly the same wires; this does not affect the registration.
 
 ## Stitching (`stitching.py`)
 
