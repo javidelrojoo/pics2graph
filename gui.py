@@ -95,6 +95,7 @@ ELECTRODES = "electrodes"
 PHOTO = "electrode photo (aligned)"
 SKELETON = "skeleton"
 WIRES = "wires"
+DANGLING = "wires left out (dead ends)"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
@@ -899,11 +900,11 @@ class Pics2GraphWidget(QWidget):
         self.g_seed = _dspin(0, 255, 0, 1, 0)
         self.g_seed.setSpecialValueText("auto")
         self.g_seed.setToolTip("Minimum contrast (gray levels over the background) to start a wire.\n"
-                               "Raise it if noise or dust is traced; auto = max(25, 6 x noise).")
+                               "Raise it if noise or dust is traced; auto = max(10, 6 x noise).")
         self.g_low = _dspin(0, 255, 0, 1, 0)
         self.g_low.setSpecialValueText("auto")
         self.g_low.setToolTip("Contrast below which a wire ends. Lower it if dim wires are cut\n"
-                              "short; auto = max(10, 3 x noise).")
+                              "short; auto = max(5, 3 x noise).")
         self.g_gap = _spin(0, 20, 2)
         self.g_gap.setToolTip("Dim stretches bridged while following a wire (steps of 1.5 px).")
         self.g_join = _dspin(0, 200, 0, 1, 0)
@@ -1096,7 +1097,7 @@ class Pics2GraphWidget(QWidget):
         if SA is None:
             return
         view = self.g_view.currentIndex()
-        self._remove(WIRES)
+        self._remove(WIRES, DANGLING)
         if view == 2:
             if not self._is_wires():
                 self._say("The wires view needs the wire-tracing method.", "warning")
@@ -1104,6 +1105,13 @@ class Pics2GraphWidget(QWidget):
             self._remove(EDGES, NODES)
             keep = [n for n in SA.L.nodes if not isinstance(n, str)]
             thick = max(1, int(round(SA.wire_width)))
+            kept = set(keep)
+            gone = [i for i in range(len(SA.wires)) if i not in kept]
+            if gone:
+                # detected, but left out of the graph by the cleaning (dead ends)
+                dang = SA.wire_label_image(thickness=thick, wires=gone) > 0
+                self.viewer.add_image(dang.astype(np.uint8), name=DANGLING, colormap="gray",
+                                      contrast_limits=(0, 2), blending="additive", opacity=0.9)
             lab = SA.wire_label_image(thickness=thick, wires=keep)
             self.viewer.add_labels(lab, name=WIRES, opacity=0.8)
             for name, opacity in ((BINARY, 0.3), (ELECTRODES, 0.25)):
@@ -1111,7 +1119,8 @@ class Pics2GraphWidget(QWidget):
                 if layer is not None and layer.opacity > opacity:
                     layer.opacity = opacity
             self.status.setText("Each color is one wire (one node of L). Hover over a wire: "
-                                "its label minus 1 is its node id in the .graphml.")
+                                "its label minus 1 is its node id in the .graphml. Gray: "
+                                "wires detected but left out (fewer than two contacts).")
             return
         line = view == 1
         if line:

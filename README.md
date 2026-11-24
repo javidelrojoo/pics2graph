@@ -115,8 +115,9 @@ Main options (`python main.py -h` lists them all):
 1. **Orientation scores.** The image is filtered with a bank of elongated ridge filters (second derivative of an anisotropic Gaussian) at 16 orientations. For every pixel this gives how strongly a wire runs through it *in each direction*, in gray levels of contrast above the local background (a smooth background gives no response, so uneven illumination does not matter). Where two wires cross, each one keeps responding in its own orientation.
 2. **Tracing.** Starting from the strongest ridge points, each wire is followed in both directions in steps of 1.5 px, re-centered on its ridge, looking only at orientations close to its current heading and with a limited curvature. At a crossing the other wire is in a different orientation, so the tracer goes straight through. Short dim stretches are bridged (`max_gap`), sharper bends are tried when the ridge is lost straight ahead, and a wire already traced in the same direction is not traced again.
 3. **Joining.** Pieces of the same wire that could not be followed in one go (shallow crossings, bright clumps, dim spots) are joined when their ends are close and their directions continue smoothly.
-4. **Contacts.** Two wires touch when their center lines come within `contact_distance` (crossings, side contacts) or an end of one is within `end_tolerance` of the other (a wire ending on another). Wires touching an electrode mask get `Vin_i` / `Vout_i` neighbors, named as before, so the downstream code that looks for `"Vin"` / `"Vout"` in the node names keeps working.
-5. **Cleaning.** Wires with fewer than two contacts are removed repeatedly (they cannot carry current), the equivalent of pruning degree-1 nodes in the skeleton method.
+4. **Ends.** The tracer tends to stop a few px short of a junction, where the other wire distorts the ridge. Each end that does not touch anything is extended straight ahead, up to 3 × width, as long as the image stays bright; if it reaches another wire, the gap is closed.
+5. **Contacts.** Two wires touch when their center lines come within `contact_distance` (crossings, side contacts) or an end of one is within `end_tolerance` of the other (a wire ending on another). Wires touching an electrode mask get `Vin_i` / `Vout_i` neighbors, named as before, so the downstream code that looks for `"Vin"` / `"Vout"` in the node names keeps working.
+6. **Cleaning.** Wires with fewer than two contacts are removed repeatedly (they cannot carry current), the equivalent of pruning degree-1 nodes in the skeleton method. They are still drawn, in gray, in the *Wires* view and in `plot_wires_on_image`, so a wire left out of the graph can be told apart from one that was not detected.
 
 Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoints (`x0`, `y0`, `x1`, `y1`) and the whole center line as `path` (`"x,y;x,y;..."`, every 3 px); each edge stores the contact position (`x`, `y`). `G` (`--graph spatial`) has the contacts as nodes and the pieces of wire between consecutive contacts as edges.
 
@@ -125,8 +126,8 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoint
 | Parameter (Python / CLI) | Default | When to change it |
 | --- | --- | --- |
 | `wire_width` / `--wire-width` | measured on the image | If the estimate printed is clearly off. Too large merges close wires; too small splits wires. |
-| `seed_threshold` / `--seed-contrast` | max(25, 6 × noise) | Raise it if dust or noise is traced as short wires. |
-| `low_threshold` / `--min-contrast` | max(10, 3 × noise) | Lower it if dim wires are cut short; raise it if traces run off the end of wires. |
+| `seed_threshold` / `--seed-contrast` | max(10, 6 × noise) | Raise it if dust or noise is traced as short wires. |
+| `low_threshold` / `--min-contrast` | max(5, 3 × noise) | Lower it if dim wires are cut short; raise it if traces run off the end of wires. |
 | `max_gap` / `--max-gap` | 2 steps (3 px) | Raise it for wires with dim spots. |
 | `join_distance` / `--join-distance` | 4 × width | Raise it if wires stay split at crossings; lower it if different wires get chained. |
 | `contact_distance` / `--contact-distance` | 0.8 × width | Distance between center lines counted as contact. |
@@ -281,6 +282,7 @@ WA.load_electrodes(path_vin, path_vout)   # optional, first
 WA.orientation_scores()
 WA.trace()
 WA.join()
+WA.extend_ends()
 WA.find_contacts()
 WA.build_graphs()                         # drop_dangling=False keeps every wire
 WA.save_graph("output.graphml", save_line_graph=True)
@@ -351,6 +353,7 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`orientation_scores(n_orientations=16, sigma_across=None, sigma_along=None, tile_size=256, max_cache_mb=1024)`**: sets up the ridge responses per orientation (computed by tiles on demand) and the best response per pixel (`R_max`, `R_arg`).
 * **`trace(seed_threshold=None, low_threshold=None, step=1.5, max_turn_deg=4, max_gap=2, ...)`**: follows every wire; `raw_wires` holds the traced pieces.
 * **`join(max_distance=None, max_angle_deg=20)`**: joins pieces of the same wire; result in `wires`.
+* **`extend_ends(max_extension=None, min_response=None)`**: closes the small gap between a wire's end and the wire it runs into.
 * **`find_contacts(contact_distance=None, end_tolerance=None)`**: `contacts` (i, j, x, y) and `electrode_contacts`.
 * **`build_graphs(drop_dangling=True)`**: builds `L` (and `L_full` before cleaning) and `G`.
 * **`save_graph(path, save_line_graph=True)`**: exports `L` or `G` to `.graphml` (with `x`/`y` on every node).
@@ -374,4 +377,4 @@ All plotting functions accept either a `SkeletonAnalysis` or a `WireAnalysis`.
 * The project uses `opencv-python-headless` (OpenCV without its own windows), which avoids Qt conflicts with napari. If you already had `opencv-python` installed, uninstall it first: `pip uninstall opencv-python`.
 * The input image to `SkeletonAnalysis` must be binarized (wires in white), preferably as `.tif`.
 * Compatible with scikit-image both before and after 0.26 (change from `min_size`/`area_threshold` to `max_size`).
-* With the example sample, `python main.py --method skeleton` reproduces the thesis' `M4_effective.graphml` (6703 nodes and 13242 edges in the line graph). On the original M4 micrograph (`muestras/M4/M4.tif` in the thesis repository) with the same electrodes, wire tracing gives about 5700 wires and 15900 contacts.
+* With the example sample, `python main.py --method skeleton` reproduces the thesis' `M4_effective.graphml` (6703 nodes and 13242 edges in the line graph). On the original M4 micrograph (`muestras/M4/M4.tif` in the thesis repository) with the same electrodes, wire tracing gives about 6300 wires and 20800 contacts.

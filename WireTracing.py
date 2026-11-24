@@ -553,16 +553,16 @@ class WireAnalysis:
               min_length=None, max_length=20000):
         """
         Trace every wire. Thresholds are in gray levels of wire contrast;
-        by default they adapt to the noise of the image (seed: max(25, 6 noise),
-        continuation: max(10, 3 noise)). ``max_turn_deg`` (per step of
+        by default they adapt to the noise of the image (seed: max(10, 6 noise),
+        continuation: max(5, 3 noise)). ``max_turn_deg`` (per step of
         ``step`` px) limits the curvature a wire can have: 4 deg per 1.5 px is
         a radius of ~21 px.
         """
         if not hasattr(self, "R_max"):
             self.orientation_scores()
         w = self.wire_width
-        high = seed_threshold if seed_threshold is not None else max(25.0, 6 * self.noise)
-        low = low_threshold if low_threshold is not None else max(10.0, 3 * self.noise)
+        high = seed_threshold if seed_threshold is not None else max(10.0, 6 * self.noise)
+        low = low_threshold if low_threshold is not None else max(5.0, 3 * self.noise)
         self.seed_threshold, self.low_threshold = high, low
         min_length = min_length if min_length is not None else 4 * w
         K = self.n_orientations
@@ -712,6 +712,58 @@ class WireAnalysis:
                 wires = new
         self.wires = [p for p in wires if polyline_length(p) >= self.min_length]
         return self.wires
+
+    def extend_ends(self, max_extension=None, min_response=None):
+        """
+        Close the small gaps between a wire's end and the wire it runs into.
+
+        The tracer tends to stop a few px short of a junction, where the other
+        wire distorts the ridge profile. From every end, walk straight ahead
+        (along the end's direction) for at most ``max_extension`` px
+        (default 3 x width) while the image still shows something bright
+        (best ridge response >= ``min_response``, default half the end
+        threshold). If another wire is reached, the end is extended up to it,
+        so that the contact is found. Returns the number of ends extended.
+        """
+        w = self.wire_width
+        max_ext = max_extension if max_extension is not None else 3 * w
+        thr = min_response if min_response is not None else 0.5 * self.low_threshold
+        reach = getattr(self, "contact_distance", None) or 0.8 * w
+        if len(self.wires) < 2:
+            return 0
+        samples = [resample_polyline(p, 1.0) for p in self.wires]
+        P = np.vstack(samples)
+        O = np.concatenate([np.full(len(s), i) for i, s in enumerate(samples)])
+        tree = cKDTree(P)
+        H, W = self.img.shape
+        Rmax = self.R_max
+        steps = np.arange(0.5, max_ext + 1e-9, 0.5)
+        extended = 0
+        new_wires = []
+        for i, p in enumerate(self.wires):
+            p = np.asarray(p, float)
+            for e in (0, 1):
+                end = p[0] if e == 0 else p[-1]
+                t = _end_tangent(p, e)
+                # already touching another wire: nothing to do
+                if any(O[j] != i for j in tree.query_ball_point(end, reach)):
+                    continue
+                hit = None
+                for s_ in steps:
+                    q = end + t * s_
+                    xi, yi = int(round(q[0])), int(round(q[1]))
+                    if not (0 <= xi < W and 0 <= yi < H) or float(Rmax[yi, xi]) < thr:
+                        break
+                    if any(O[j] != i for j in tree.query_ball_point(q, reach)):
+                        hit = q
+                        break
+                if hit is not None:
+                    p = np.vstack([hit, p]) if e == 0 else np.vstack([p, hit])
+                    extended += 1
+            new_wires.append(p)
+        self.wires = new_wires
+        self.n_extended = extended
+        return extended
 
     # -------------------------------------------------------------- 4. contacts
     def find_contacts(self, contact_distance=None, end_tolerance=None):
@@ -886,7 +938,7 @@ class WireAnalysis:
     def complete_analysis(self, electrodes_path=None, clean_network=True, save_graph_path=None,
                           n_orientations=16, seed_threshold=None, low_threshold=None,
                           max_gap=2, join_distance=None, min_length=None,
-                          contact_distance=None, end_tolerance=None,
+                          contact_distance=None, end_tolerance=None, extend_ends=True,
                           keep_scores=False, verbose=False):
         """Run the whole pipeline. Returns ``self.L``."""
         import time
@@ -907,6 +959,9 @@ class WireAnalysis:
             f"(seed >= {self.seed_threshold:.1f}, continue >= {self.low_threshold:.1f}).")
         self.join(max_distance=join_distance)
         log(f"Joined into {len(self.wires)} wires.")
+        if extend_ends:
+            n = self.extend_ends()
+            log(f"Extended {n} wire ends up to the wire they run into.")
         self.find_contacts(contact_distance=contact_distance, end_tolerance=end_tolerance)
         log(f"{len(self.contacts)} wire-wire contacts, "
             f"{len(self.electrode_contacts)} electrode contacts.")

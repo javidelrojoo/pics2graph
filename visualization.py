@@ -339,15 +339,17 @@ def plot_line_graph_on_image(SA, L=None, xlim=None, ylim=None, transparent=False
 
 def plot_wires_on_image(WA, xlim=None, ylim=None, save_path=None, dpi=200, ax=None,
                         background="img", bg_cmap="gray", bg_alpha=0.6,
-                        linewidth=1.0, contacts=True, contact_size=6, seed=0):
+                        linewidth=1.0, contacts=True, contact_size=6, seed=0,
+                        show_dangling=True):
     """
     Draw every wire found by ``WireAnalysis`` in its own color over the
     micrograph, with the wire-wire contacts as white dots and the electrode
     contacts in red (Vin) and blue (Vout). This is the view to check that each
     node of the graph is really one whole wire.
 
-    Only wires kept in ``WA.L`` are drawn (after dropping dangling wires);
-    pass ``WA.L = WA.L_full`` first to see all of them.
+    With ``show_dangling`` the wires that were detected but left out of the
+    graph by the cleaning (fewer than two contacts, so they cannot carry
+    current) are drawn in gray, to tell them apart from wires never detected.
     """
     import numpy as np
     from matplotlib.collections import LineCollection
@@ -359,9 +361,13 @@ def plot_wires_on_image(WA, xlim=None, ylim=None, save_path=None, dpi=200, ax=No
         ax.imshow(bg, cmap=bg_cmap, alpha=bg_alpha)
 
     keep = [n for n in WA.L.nodes if not isinstance(n, str)]
+    f = _zoom_factor(WA, xlim, ylim, "auto")
+    if show_dangling:
+        kept = set(keep)
+        gone = [np.asarray(p) for i, p in enumerate(WA.wires) if i not in kept]
+        ax.add_collection(LineCollection(gone, colors="0.6", linewidths=0.6 * linewidth * f ** 0.5))
     rng = np.random.default_rng(seed)
     colors = rng.uniform(0.25, 1.0, (len(keep), 3))
-    f = _zoom_factor(WA, xlim, ylim, "auto")
     lc = LineCollection([np.asarray(WA.wires[i]) for i in keep], colors=colors,
                         linewidths=linewidth * f ** 0.5)
     ax.add_collection(lc)

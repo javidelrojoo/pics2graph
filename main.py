@@ -98,9 +98,9 @@ def parse_args():
                    help="Wires darker than the background (bright field).")
     w.add_argument("--seed-contrast", type=float, default=None,
                    help="Minimum contrast (gray levels) to start a wire "
-                        "(default: max(25, 6 x noise)).")
+                        "(default: max(10, 6 x noise)).")
     w.add_argument("--min-contrast", type=float, default=None,
-                   help="Contrast below which a wire ends (default: max(10, 3 x noise)).")
+                   help="Contrast below which a wire ends (default: max(5, 3 x noise)).")
     w.add_argument("--max-gap", type=int, default=2,
                    help="Dim stretches bridged while tracing, in steps of 1.5 px.")
     w.add_argument("--join-distance", type=float, default=None,
