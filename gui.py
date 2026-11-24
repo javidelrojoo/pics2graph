@@ -58,9 +58,9 @@ def _load_modules(report=print):
     each step so the user can see that the program is loading, not frozen.
     """
     global _LOADED, cv2, np, napari, thread_worker, show_error, show_info, show_warning
-    global pre, st, er, SkeletonAnalysis
+    global pre, st, er, SkeletonAnalysis, WireAnalysis
     global get_line_graph_positions, get_node_positions
-    global plot_line_graph_on_image, plot_network_on_image
+    global plot_line_graph_on_image, plot_network_on_image, plot_wires_on_image
     if _LOADED:
         return
 
@@ -76,6 +76,7 @@ def _load_modules(report=print):
     report("Loading scikit-image and skan...")
     import preprocessing as pre
     from SkeletonAnalysis import SkeletonAnalysis
+    from WireTracing import WireAnalysis
 
     report("Loading matplotlib and the stitching module...")
     import matplotlib
@@ -83,7 +84,8 @@ def _load_modules(report=print):
     import stitching as st
     import electrode_registration as er
     from visualization import (get_line_graph_positions, get_node_positions,
-                               plot_line_graph_on_image, plot_network_on_image)
+                               plot_line_graph_on_image, plot_network_on_image,
+                               plot_wires_on_image)
     _LOADED = True
 
 # Layer names
@@ -92,6 +94,7 @@ BINARY = "binary"
 ELECTRODES = "electrodes"
 PHOTO = "electrode photo (aligned)"
 SKELETON = "skeleton"
+WIRES = "wires"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
@@ -208,7 +211,7 @@ class Pics2GraphWidget(QWidget):
         self.viewer = viewer
         self.raw_path = None        # path of the micrograph, if any
         self.raw_gray = None        # uint8 grayscale copy used for binarization
-        self.SA = None              # last SkeletonAnalysis
+        self.SA = None              # last SkeletonAnalysis / WireAnalysis
         self._workers = []          # keep references to running threads
 
         self._preview_timer = QTimer(self)
@@ -450,7 +453,8 @@ class Pics2GraphWidget(QWidget):
         self.viewer.layers.move(self.viewer.layers.index(RAW), 0)   # keep it at the bottom
         self.viewer.reset_view()
         h, w = img.shape[:2]
-        self._say(f"Opened {os.path.basename(path)} ({w} x {h} px). Next: 2. Binarize.")
+        self._say(f"Opened {os.path.basename(path)} ({w} x {h} px). Next: 3. Electrodes and "
+                  "4. Graph (wire tracing), or 2. Binarize for the skeleton method.")
 
     def open_binary(self, path):
         mask = imread(path, cv2.IMREAD_GRAYSCALE) > 0
@@ -871,10 +875,57 @@ class Pics2GraphWidget(QWidget):
 
         box = QGroupBox("Extract")
         f = QFormLayout(box)
-        self.g_clean = QCheckBox("Clean network (prune degree 1, collapse degree 2)")
+        self.g_method = _combo(["Trace wires on the micrograph (node = whole wire)",
+                                "Skeleton of the binary image (node = wire segment)"])
+        self.g_method.setToolTip(
+            "Trace wires: follows each wire on the grayscale micrograph, without binarizing\n"
+            "or skeletonizing it; wires keep their identity through crossings, so each node\n"
+            "of the graph is a whole wire. Uses the binary image only if no micrograph is open.\n"
+            "Skeleton: the original pipeline (tab 2 binary image -> skeleton -> graph).")
+        self.g_method.currentIndexChanged.connect(self._update_method)
+        f.addRow("Method", self.g_method)
+        self.g_clean = QCheckBox("Clean network (drop dangling wires / segments)")
         self.g_clean.setChecked(True)
+        self.g_clean.setToolTip("Wire tracing: repeatedly remove wires with fewer than two contacts.\n"
+                                "Skeleton: prune degree-1 nodes and collapse degree-2 nodes.")
         self.g_use_el = QCheckBox("Use electrodes")
         self.g_use_el.setChecked(True)
+
+        self.g_wire_box = QGroupBox("Wire tracing")
+        wf = QFormLayout(self.g_wire_box)
+        self.g_width = _dspin(0, 50, 0, 0.1, 1)
+        self.g_width.setSpecialValueText("auto")
+        self.g_width.setToolTip("Width of a wire in px (auto = measured on the image).")
+        self.g_seed = _dspin(0, 255, 0, 1, 0)
+        self.g_seed.setSpecialValueText("auto")
+        self.g_seed.setToolTip("Minimum contrast (gray levels over the background) to start a wire.\n"
+                               "Raise it if noise or dust is traced; auto = max(25, 6 x noise).")
+        self.g_low = _dspin(0, 255, 0, 1, 0)
+        self.g_low.setSpecialValueText("auto")
+        self.g_low.setToolTip("Contrast below which a wire ends. Lower it if dim wires are cut\n"
+                              "short; auto = max(10, 3 x noise).")
+        self.g_gap = _spin(0, 20, 2)
+        self.g_gap.setToolTip("Dim stretches bridged while following a wire (steps of 1.5 px).")
+        self.g_join = _dspin(0, 200, 0, 1, 0)
+        self.g_join.setSpecialValueText("auto")
+        self.g_join.setToolTip("Join two pieces of a wire when their ends are this close (px) and\n"
+                               "their directions continue smoothly; auto = 4 x wire width.")
+        self.g_contact = _dspin(0, 50, 0, 0.1, 1)
+        self.g_contact.setSpecialValueText("auto")
+        self.g_contact.setToolTip("Two wires touch when their center lines come this close (px);\n"
+                                  "auto = 0.8 x wire width.")
+        self.g_invert = QCheckBox("Wires darker than background (bright field)")
+        wf.addRow("Wire width (px)", self.g_width)
+        wf.addRow("Start contrast", self.g_seed)
+        wf.addRow("End contrast", self.g_low)
+        wf.addRow("Max gap (steps)", self.g_gap)
+        wf.addRow("Join distance (px)", self.g_join)
+        wf.addRow("Contact distance (px)", self.g_contact)
+        wf.addRow(self.g_invert)
+
+        self.g_skel_box = QGroupBox("Skeleton")
+        f_outer = f
+        f = QFormLayout(self.g_skel_box)
         self.g_opening = _spin(0, 10, 1)
         self.g_opening.setToolTip(
             "Morphological opening before skeletonizing: removes structures thinner than\n"
@@ -889,6 +940,9 @@ class Pics2GraphWidget(QWidget):
         f.addRow("Closing radius", self.g_closing)
         f.addRow("Opening radius", self.g_opening)
         f.addRow("Remove specks up to (px)", self.g_min_obj)
+        f = f_outer
+        f.addRow(self.g_wire_box)
+        f.addRow(self.g_skel_box)
         f.addRow(self.g_clean)
         f.addRow(self.g_use_el)
         self.btn_extract = QPushButton("Extract graph")
@@ -902,7 +956,8 @@ class Pics2GraphWidget(QWidget):
         box = QGroupBox("View")
         f = QFormLayout(box)
         self.g_view = _combo(["Spatial graph G (nodes = junctions)",
-                              "Line graph L (nodes = wires)"])
+                              "Line graph L (nodes = wires)",
+                              "Wires (one color per wire; wire tracing)"])
         self.g_view.currentIndexChanged.connect(lambda _: self.draw_graph())
         self.g_node_size = _spin(1, 200, 8)
         self.g_edge_width = _dspin(0.5, 50, 2.0, 0.5, 1)
@@ -931,9 +986,17 @@ class Pics2GraphWidget(QWidget):
         f.addRow(btn)
         lay.addWidget(box)
         lay.addStretch()
+        self._update_method()
         return w
 
+    def _update_method(self, *_):
+        wires = self.g_method.currentIndex() == 0
+        self.g_wire_box.setVisible(wires)
+        self.g_skel_box.setVisible(not wires)
+
     def extract_graph(self):
+        if self.g_method.currentIndex() == 0:
+            return self.extract_wires()
         mask = self.binary_mask()
         if mask is None:
             self._say("There is no binary image yet (tabs 1-2).", "warning")
@@ -964,13 +1027,59 @@ class Pics2GraphWidget(QWidget):
 
         self._run(job, self._graph_done, self.btn_extract, "Extracting graph...")
 
+    def extract_wires(self):
+        if self.raw_gray is not None:
+            img = self.raw_gray
+        else:
+            mask = self.binary_mask()
+            if mask is None:
+                self._say("Open a micrograph first (tab 1).", "warning")
+                return
+            img = mask.astype(np.uint8) * 255
+            show_warning("No micrograph open: tracing the wires on the binary image, "
+                         "which is less faithful than the original micrograph.")
+        masks = self.electrode_masks() if self.g_use_el.isChecked() else None
+        if self.g_use_el.isChecked() and masks is None:
+            show_warning("No electrodes painted (both Vin and Vout are needed): "
+                         "extracting the graph without electrodes.")
+        auto = lambda w: w.value() or None          # noqa: E731  (0 = auto)
+        width, seed, low = auto(self.g_width), auto(self.g_seed), auto(self.g_low)
+        join, contact = auto(self.g_join), auto(self.g_contact)
+        gap, invert, clean = self.g_gap.value(), self.g_invert.isChecked(), self.g_clean.isChecked()
+        raw_path = self.raw_path
+
+        def job():
+            WA = WireAnalysis(img=img, wire_width=width, invert=invert)
+            WA.original_img_path = raw_path
+            WA.complete_analysis(electrodes_path=masks, clean_network=clean,
+                                 seed_threshold=seed, low_threshold=low, max_gap=gap,
+                                 join_distance=join, contact_distance=contact)
+            return WA
+
+        self._run(job, self._graph_done, self.btn_extract,
+                  "Tracing wires (this can take a minute on large images)...")
+
     def _graph_done(self, SA):
         self.SA = SA
         G, L = SA.G, SA.L
-        n_vin = sum(1 for n in G if isinstance(n, str) and n.startswith("Vin_"))
-        n_vout = sum(1 for n in G if isinstance(n, str) and n.startswith("Vout_"))
-        txt = (f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n"
-               f"L: {L.number_of_nodes()} nodes, {L.number_of_edges()} edges")
+        n_vin = sum(1 for n in L if isinstance(n, str) and n.startswith("Vin_")) if self._is_wires() \
+            else sum(1 for n in G if isinstance(n, str) and n.startswith("Vin_"))
+        n_vout = sum(1 for n in L if isinstance(n, str) and n.startswith("Vout_")) if self._is_wires() \
+            else sum(1 for n in G if isinstance(n, str) and n.startswith("Vout_"))
+        if self._is_wires():
+            n_w = sum(1 for n in L if not isinstance(n, str))
+            txt = (f"Wire width {SA.wire_width:.1f} px, start contrast {SA.seed_threshold:.0f}, "
+                   f"end contrast {SA.low_threshold:.0f}\n"
+                   f"L: {n_w} wires, {L.number_of_edges() - n_vin - n_vout} contacts "
+                   f"({len(SA.wires)} wires found before cleaning)\n"
+                   f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            if self.g_view.currentIndex() == 0:
+                self.g_view.setCurrentIndex(2)
+        else:
+            txt = (f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n"
+                   f"L: {L.number_of_nodes()} nodes, {L.number_of_edges()} edges")
+            if self.g_view.currentIndex() == 2:
+                self.g_view.setCurrentIndex(1)
         if n_vin or n_vout:
             txt += f"\nElectrode contacts: {n_vin} Vin, {n_vout} Vout"
         self.g_stats.setText(txt)
@@ -979,15 +1088,38 @@ class Pics2GraphWidget(QWidget):
         self.draw_graph()
         self._say("Graph extracted. Next: export it below.")
 
+    def _is_wires(self):
+        return self.SA is not None and hasattr(self.SA, "wires")
+
     def draw_graph(self):
         SA = self.SA
         if SA is None:
             return
-        line = self.g_view.currentIndex() == 1
+        view = self.g_view.currentIndex()
+        self._remove(WIRES)
+        if view == 2:
+            if not self._is_wires():
+                self._say("The wires view needs the wire-tracing method.", "warning")
+                return
+            self._remove(EDGES, NODES)
+            keep = [n for n in SA.L.nodes if not isinstance(n, str)]
+            thick = max(1, int(round(SA.wire_width)))
+            lab = SA.wire_label_image(thickness=thick, wires=keep)
+            self.viewer.add_labels(lab, name=WIRES, opacity=0.8)
+            for name, opacity in ((BINARY, 0.3), (ELECTRODES, 0.25)):
+                layer = self._layer(name)
+                if layer is not None and layer.opacity > opacity:
+                    layer.opacity = opacity
+            self.status.setText("Each color is one wire (one node of L). Hover over a wire: "
+                                "its label minus 1 is its node id in the .graphml.")
+            return
+        line = view == 1
         if line:
             graph, pos = SA.L, get_line_graph_positions(SA)
 
             def is_el(n, p):
+                if not isinstance(n, tuple):
+                    return isinstance(n, str) and n.startswith(p)
                 return any(isinstance(m, str) and m.startswith(p) for m in (n[0], n[1]))
         else:
             graph, pos = SA.G, get_node_positions(SA)
@@ -1064,7 +1196,9 @@ class Pics2GraphWidget(QWidget):
         if not path:
             return
         import matplotlib.pyplot as plt
-        if self.g_view.currentIndex() == 1:
+        if self.g_view.currentIndex() == 2 and self._is_wires():
+            ax = plot_wires_on_image(self.SA, save_path=path, dpi=400)
+        elif self.g_view.currentIndex() == 1:
             ax = plot_line_graph_on_image(self.SA, save_path=path, dpi=400)
         else:
             ax = plot_network_on_image(self.SA, save_path=path, dpi=400)

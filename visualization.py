@@ -216,7 +216,9 @@ def get_line_graph_positions(SA, L=None, pos_G=None):
     """
     Positions for the line graph nodes: each node of ``L`` is an edge
     ``(u, v)`` of ``G`` (a nanowire), and it is placed at the **centroid** of
-    the positions of its two endpoints.
+    the positions of its two endpoints. For a ``WireAnalysis`` (nodes = whole
+    wires) the ``x`` / ``y`` attributes of each node (the centroid of the wire)
+    are used instead.
 
     Parameters
     ----------
@@ -234,6 +236,9 @@ def get_line_graph_positions(SA, L=None, pos_G=None):
     """
     if L is None:
         L = SA.L
+    if all("x" in d and "y" in d for _, d in L.nodes(data=True)):
+        # WireAnalysis: nodes are whole wires and already carry their position
+        return {n: (d["x"], d["y"]) for n, d in L.nodes(data=True)}
     if pos_G is None:
         pos_G = get_node_positions(SA)
 
@@ -303,7 +308,9 @@ def plot_line_graph_on_image(SA, L=None, xlim=None, ylim=None, transparent=False
         ax.imshow(bg, cmap=bg_cmap, alpha=0 if transparent else bg_alpha)
 
     def _touches(e, prefix):
-        return any(_is_electrode(n, prefix) for n in (e[0], e[1]))
+        if isinstance(e, tuple):                  # SkeletonAnalysis: e = (u, v)
+            return any(_is_electrode(n, prefix) for n in (e[0], e[1]))
+        return _is_electrode(e, prefix)           # WireAnalysis: e = wire or Vin_i
 
     vin_nodes = [e for e in L.nodes if _touches(e, "Vin_")]
     vout_nodes = [e for e in L.nodes if _touches(e, "Vout_")]
@@ -325,6 +332,52 @@ def plot_line_graph_on_image(SA, L=None, xlim=None, ylim=None, transparent=False
     if transparent:
         ax.figure.patch.set_alpha(0)
         ax.patch.set_alpha(0)
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
+    return ax
+
+
+def plot_wires_on_image(WA, xlim=None, ylim=None, save_path=None, dpi=200, ax=None,
+                        background="img", bg_cmap="gray", bg_alpha=0.6,
+                        linewidth=1.0, contacts=True, contact_size=6, seed=0):
+    """
+    Draw every wire found by ``WireAnalysis`` in its own color over the
+    micrograph, with the wire-wire contacts as white dots and the electrode
+    contacts in red (Vin) and blue (Vout). This is the view to check that each
+    node of the graph is really one whole wire.
+
+    Only wires kept in ``WA.L`` are drawn (after dropping dangling wires);
+    pass ``WA.L = WA.L_full`` first to see all of them.
+    """
+    import numpy as np
+    from matplotlib.collections import LineCollection
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 8))
+    bg = _get_background(WA, background)
+    if bg is not None:
+        ax.imshow(bg, cmap=bg_cmap, alpha=bg_alpha)
+
+    keep = [n for n in WA.L.nodes if not isinstance(n, str)]
+    rng = np.random.default_rng(seed)
+    colors = rng.uniform(0.25, 1.0, (len(keep), 3))
+    f = _zoom_factor(WA, xlim, ylim, "auto")
+    lc = LineCollection([np.asarray(WA.wires[i]) for i in keep], colors=colors,
+                        linewidths=linewidth * f ** 0.5)
+    ax.add_collection(lc)
+    if contacts:
+        xy = np.array([(d["x"], d["y"]) for u, v, d in WA.L.edges(data=True)
+                       if not (isinstance(u, str) or isinstance(v, str))]).reshape(-1, 2)
+        ax.scatter(xy[:, 0], xy[:, 1], s=contact_size * f, c="white", linewidths=0)
+        for prefix, color in (("Vin_", "red"), ("Vout_", "blue")):
+            xy = np.array([WA.electrode_pos[n] for n in WA.L.nodes
+                           if _is_electrode(n, prefix)]).reshape(-1, 2)
+            ax.scatter(xy[:, 0], xy[:, 1], s=4 * contact_size * f, c=color, linewidths=0)
+    h, w = WA.img.shape[:2]
+    ax.set_xlim(*(xlim or (0, w)))
+    ax.set_ylim(*(ylim or (h, 0)))
+    ax.set_aspect("equal")
+    ax.axis("off")
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
     return ax

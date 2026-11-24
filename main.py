@@ -4,23 +4,35 @@ main
 
 Entry point of the image -> graph pipeline.
 
-Takes a photomicrograph (already binarized, or raw with ``--binarize``), or a
-folder of tiles to stitch first with Fiji (``--stitch``), and optionally the
-electrode masks; extracts the network with ``SkeletonAnalysis`` and saves the
-graph as .graphml.
+Takes a photomicrograph, or a folder of tiles to stitch first with Fiji
+(``--stitch``), and optionally the electrode masks, and saves the graph as
+.graphml. Two methods:
+
+* ``--method wires`` (default): ``WireTracing`` follows each wire directly on
+  the grayscale micrograph (no binarization, no skeleton). Nodes = whole
+  wires, edges = contacts.
+* ``--method skeleton``: the original pipeline, ``SkeletonAnalysis`` on a
+  binary image (or a raw one with ``--binarize``). Nodes of the line graph =
+  wire segments between junctions.
 
 Examples
 --------
-    # Example sample included in the repo (binary image + electrodes)
-    python main.py
+    # Raw micrograph -> graph of whole wires
+    python main.py --image path/M4.tif \
+        --electrodes path/M4_electrode_mask1.tif path/M4_electrode_mask2.tif
+
+    # Example sample included in the repo with the original pipeline
+    # (reproduces the thesis' M4_effective.graphml)
+    python main.py --method skeleton
 
     # Your own binary image, without electrodes
     python main.py --image path/M5_binary.tif --output M5.graphml
 
-    # Raw image: binarize first, then extract the graph
-    python main.py --image path/M5.tif --binarize --block-size 151 --C 15 --threshold 55
+    # Raw image, original pipeline: binarize first, then extract the graph
+    python main.py --method skeleton --image path/M5.tif --binarize \
+        --block-size 151 --C 15 --threshold 55
 
-    # Folder of tiles: stitch with Fiji, binarize, then extract the graph
+    # Folder of tiles: stitch with Fiji, then extract the graph of wires
     python main.py --stitch path/M5_tiles --fiji C:/fiji-stable-win64-jdk/Fiji.app
 
     # With electrodes, also saving the figure of the graph over the image
@@ -36,6 +48,7 @@ import cv2
 
 import preprocessing as pre
 from SkeletonAnalysis import SkeletonAnalysis
+from WireTracing import WireAnalysis
 from stitching import stitch
 
 # Defaults: the example sample included in ./example/M4
@@ -61,8 +74,13 @@ def parse_args():
     p.add_argument("--graph", choices=("line", "spatial"), default="line",
                    help="Which graph to save: the line graph (nodes = wires, default) "
                         "or the spatial graph (nodes = junctions).")
+    p.add_argument("--method", choices=("wires", "skeleton"), default="wires",
+                   help="'wires' (default): trace each wire on the grayscale micrograph, "
+                        "nodes = whole wires. 'skeleton': original binarize + skeletonize "
+                        "pipeline, nodes = wire segments.")
     p.add_argument("--no-clean", action="store_true",
-                   help="Do not prune degree-1 nodes nor collapse degree-2 nodes.")
+                   help="Keep dangling parts: wires with fewer than two contacts (wires), "
+                        "or degree-1/degree-2 nodes (skeleton).")
     p.add_argument("--opening-radius", type=int, default=1,
                    help="Radius of the morphological opening before skeletonizing "
                         "(default 1; use 0 when the wires are 1-2 px wide, e.g. SEM "
@@ -73,9 +91,31 @@ def parse_args():
                    help="Radius of a morphological closing before skeletonizing, to keep "
                         "thin noisy wires continuous (SEM: 1 at downsample 4, 2 at downsample 2).")
 
+    w = p.add_argument_group("wire tracing (only with --method wires)")
+    w.add_argument("--wire-width", type=float, default=None,
+                   help="Wire width in px (default: estimated from the image).")
+    w.add_argument("--invert", action="store_true",
+                   help="Wires darker than the background (bright field).")
+    w.add_argument("--seed-contrast", type=float, default=None,
+                   help="Minimum contrast (gray levels) to start a wire "
+                        "(default: max(25, 6 x noise)).")
+    w.add_argument("--min-contrast", type=float, default=None,
+                   help="Contrast below which a wire ends (default: max(10, 3 x noise)).")
+    w.add_argument("--max-gap", type=int, default=2,
+                   help="Dim stretches bridged while tracing, in steps of 1.5 px.")
+    w.add_argument("--join-distance", type=float, default=None,
+                   help="Join pieces of a wire whose ends are this close and aligned "
+                        "(default: 4 x wire width).")
+    w.add_argument("--contact-distance", type=float, default=None,
+                   help="Center lines closer than this are in contact "
+                        "(default: 0.8 x wire width).")
+    w.add_argument("--orientations", type=int, default=16,
+                   help="Number of orientation layers (default 16).")
+
     s = p.add_argument_group("stitching (Fiji, see stitching.py for all options)")
     s.add_argument("--stitch", metavar="TILES_DIR", default=None,
-                   help="Folder of tiles: stitch them with Fiji first (implies --binarize). "
+                   help="Folder of tiles: stitch them with Fiji first (with --method "
+                        "skeleton it implies --binarize). "
                         "The mosaic is saved as <TILES_DIR>/Fused.tif unless --image is given.")
     s.add_argument("--fiji", default=None, help="Fiji.app folder or launcher (or set FIJI_PATH).")
     s.add_argument("--stitch-mode", choices=("unknown", "positions"), default="unknown",
@@ -87,7 +127,7 @@ def parse_args():
     s.add_argument("--stitch-gray", action="store_true",
                    help="Convert the tiles to 8-bit gray before stitching.")
 
-    b = p.add_argument_group("binarization (only with --binarize)")
+    b = p.add_argument_group("binarization (only with --method skeleton --binarize)")
     b.add_argument("--binarize", action="store_true",
                    help="The image is raw: binarize it before extracting the graph.")
     b.add_argument("--block-size", type=int, default=151)
@@ -114,7 +154,12 @@ def main():
                           fiji_path=args.fiji, memory=args.fiji_memory,
                           downsample=args.stitch_downsample, tiles_to_gray=args.stitch_gray,
                           verbose=verbose)
-        args.binarize = True
+        args.binarize = args.method == "skeleton"
+
+    if args.binarize and args.method == "wires":
+        print("Note: --binarize is ignored with --method wires (it works on the "
+              "grayscale micrograph).")
+        args.binarize = False
 
     if args.binarize:
         img = pre.load_gray(img_path)
@@ -136,33 +181,60 @@ def main():
 
     output = args.output
     if output is None:
-        output = SAVE_GRAPH_PATH if using_default else os.path.splitext(img_path)[0] + ".graphml"
+        if using_default and args.method == "skeleton":
+            output = SAVE_GRAPH_PATH
+        else:
+            suffix = "_wires" if args.method == "wires" else ""
+            output = os.path.splitext(img_path)[0] + suffix + ".graphml"
 
-    SA = SkeletonAnalysis(img_path)
-    if SA.img is None:
-        raise FileNotFoundError(f"Could not read the image: {img_path}")
-
-    SA.complete_analysis(
-        clean_network=not args.no_clean,
-        electrodes_path=tuple(electrodes) if electrodes else None,
-        save_graph_path=None,
-        plot=False,
-        verbose=verbose,
-        opening_radius=args.opening_radius,
-        min_object_size=args.min_object_size,
-        closing_radius=args.closing_radius,
-    )
+    if args.method == "wires":
+        if using_default:
+            print("Note: the example in the repo is a binary image; the wire tracing "
+                  "is more faithful on the original micrograph (--image path/M4.tif).")
+        SA = WireAnalysis(img_path, wire_width=args.wire_width, invert=args.invert)
+        if verbose:
+            print(f"Wire width: {SA.wire_width:.1f} px.")
+        SA.complete_analysis(
+            electrodes_path=tuple(electrodes) if electrodes else None,
+            clean_network=not args.no_clean,
+            n_orientations=args.orientations,
+            seed_threshold=args.seed_contrast,
+            low_threshold=args.min_contrast,
+            max_gap=args.max_gap,
+            join_distance=args.join_distance,
+            contact_distance=args.contact_distance,
+            verbose=verbose,
+        )
+    else:
+        SA = SkeletonAnalysis(img_path)
+        if SA.img is None:
+            raise FileNotFoundError(f"Could not read the image: {img_path}")
+        SA.complete_analysis(
+            clean_network=not args.no_clean,
+            electrodes_path=tuple(electrodes) if electrodes else None,
+            save_graph_path=None,
+            plot=False,
+            verbose=verbose,
+            opening_radius=args.opening_radius,
+            min_object_size=args.min_object_size,
+            closing_radius=args.closing_radius,
+        )
     SA.save_graph(output, save_line_graph=(args.graph == "line"))
     if verbose:
         G, L = SA.G, SA.L
         print(f"Spatial graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
-        print(f"Line graph: {L.number_of_nodes()} nodes, {L.number_of_edges()} edges.")
+        what = "wires" if args.method == "wires" else "wire segments"
+        print(f"Line graph: {L.number_of_nodes()} nodes ({what}), {L.number_of_edges()} edges.")
         print(f"Graph ({args.graph}) saved to {output}.")
 
     if args.plot or args.save_plot:
         import matplotlib.pyplot as plt
-        from visualization import plot_network_on_image
-        plot_network_on_image(SA, save_path=args.save_plot, dpi=400)
+        if args.method == "wires":
+            from visualization import plot_wires_on_image
+            plot_wires_on_image(SA, save_path=args.save_plot, dpi=400)
+        else:
+            from visualization import plot_network_on_image
+            plot_network_on_image(SA, save_path=args.save_plot, dpi=400)
         if args.plot:
             plt.show()
 
