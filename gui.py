@@ -97,6 +97,7 @@ SKELETON = "skeleton"
 WIRES = "wires"
 DANGLING = "wires left out (dead ends)"
 EXCLUDE = "areas to ignore"
+EXCLUDE_SHAPES = "rectangles to ignore"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
@@ -987,7 +988,15 @@ class Pics2GraphWidget(QWidget):
             "rows of dots or substrate outside the network that get traced as wires.\n"
             "Then extract the graph again.")
         self.btn_exclude.clicked.connect(self.paint_exclusion)
+        self.btn_exclude_rect = QPushButton("Draw rectangles to ignore")
+        self.btn_exclude_rect.setToolTip(
+            "Creates the 'rectangles to ignore' layer and selects the rectangle tool:\n"
+            "drag over each area to leave out (an electrode region, a dirty corner...).\n"
+            "The layer's other tools (ellipse, polygon) work too; select a shape and\n"
+            "press Delete to remove it. Then extract the graph again.")
+        self.btn_exclude_rect.clicked.connect(self.draw_exclusion_rectangles)
         self.btn_exclude_clear = QPushButton("Clear")
+        self.btn_exclude_clear.setToolTip("Erase the painted areas and the rectangles to ignore.")
         self.btn_exclude_clear.clicked.connect(self.clear_exclusion)
         wf.addRow("Wire width (px)", self.g_width)
         wf.addRow("Start contrast", self.g_seed)
@@ -996,7 +1005,8 @@ class Pics2GraphWidget(QWidget):
         wf.addRow("Join distance (px)", self.g_join)
         wf.addRow("Contact distance (px)", self.g_contact)
         wf.addRow(self.g_invert)
-        wf.addRow(_hbox(self.btn_exclude, self.btn_exclude_clear))
+        wf.addRow(_hbox(self.btn_exclude, self.btn_exclude_rect))
+        wf.addRow(self.btn_exclude_clear)
 
         self.g_skel_box = QGroupBox("Skeleton")
         f_outer = f
@@ -1095,17 +1105,42 @@ class Pics2GraphWidget(QWidget):
         layer.mode = "paint"
         self._say("Paint the areas to ignore, then extract the graph again.")
 
+    def draw_exclusion_rectangles(self):
+        layer = self._layer(EXCLUDE_SHAPES)
+        if layer is None:
+            if self._shape() is None:
+                self._say("Open an image first (tab 1).", "warning")
+                return
+            layer = self.viewer.add_shapes(
+                name=EXCLUDE_SHAPES, ndim=2, edge_width=4, edge_color="red",
+                face_color=[1.0, 0.0, 0.0, 0.25], opacity=1.0)
+        self.viewer.layers.selection.active = layer
+        layer.mode = "add_rectangle"
+        self._say("Drag rectangles over the areas to ignore, then extract the graph again.")
+
     def clear_exclusion(self):
         layer = self._layer(EXCLUDE)
         if layer is not None:
             layer.data = np.zeros_like(layer.data)
+        layer = self._layer(EXCLUDE_SHAPES)
+        if layer is not None and len(layer.data):
+            layer.selected_data = set(range(len(layer.data)))
+            layer.remove_selected()
 
     def exclusion_mask(self):
+        """Painted areas and drawn shapes to ignore, as one mask (None if empty)."""
+        shape = self._shape()
+        mask = None
         layer = self._layer(EXCLUDE)
-        if layer is None:
-            return None
-        data = np.asarray(layer.data) > 0
-        return data if data.any() else None
+        if layer is not None:
+            data = np.asarray(layer.data) > 0
+            if shape is None or data.shape == tuple(shape):
+                mask = data
+        layer = self._layer(EXCLUDE_SHAPES)
+        if layer is not None and len(layer.data) and shape is not None:
+            drawn = np.asarray(layer.to_labels(labels_shape=tuple(shape))) > 0
+            mask = drawn if mask is None else (mask | drawn)
+        return mask if mask is not None and mask.any() else None
 
     def _update_method(self, *_):
         wires = self.g_method.currentIndex() == 0

@@ -135,7 +135,7 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoint
 | `join_distance` / `--join-distance` | 4 × width | Raise it if wires stay split at crossings; lower it if different wires get chained. |
 | `contact_distance` / `--contact-distance` | 0.8 × width | Distance between center lines counted as contact. |
 | `invert` / `--invert` | off | Wires darker than the background (bright field). |
-| `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI: *Paint areas to ignore* in tab 4. |
+| `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI (tab 4): *Paint areas to ignore* with a brush, or *Draw rectangles to ignore* (the shapes layer also takes ellipses and polygons). |
 
 Wires must be brighter than the background (optical dark field, SEM), otherwise use `invert`. It also accepts a binary image (it is blurred first), but it is more faithful on the original micrograph, where crossing wires can still be told apart. The orientation scores are computed by tiles and cached, so memory stays at a few bytes per pixel even for very large mosaics; the M4 sample (2767 × 2424 px) takes about 20 s.
 
