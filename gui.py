@@ -1046,6 +1046,23 @@ class Pics2GraphWidget(QWidget):
         f.addRow(self.g_skeleton)
         lay.addWidget(box)
 
+        box = QGroupBox("Edit (wire tracing)")
+        f = QFormLayout(box)
+        self.btn_delete = QPushButton("Delete wires by clicking")
+        self.btn_delete.setCheckable(True)
+        self.btn_delete.setToolTip(
+            "While pressed, a click on a wire deletes it from the graph (with its contacts);\n"
+            "the graph is rebuilt at once, so wires left with fewer than two contacts turn\n"
+            "gray. Works in the Wires view.")
+        self.btn_delete.toggled.connect(self._toggle_delete_mode)
+        self.btn_undo_delete = QPushButton("Undo")
+        self.btn_undo_delete.clicked.connect(self.undo_delete)
+        self.btn_restore = QPushButton("Restore all")
+        self.btn_restore.clicked.connect(self.restore_deleted)
+        f.addRow(self.btn_delete)
+        f.addRow(_hbox(self.btn_undo_delete, self.btn_restore))
+        lay.addWidget(box)
+
         box = QGroupBox("Export")
         f = QFormLayout(box)
         self.g_save_kind = _combo(["line graph L", "spatial graph G"])
@@ -1167,6 +1184,20 @@ class Pics2GraphWidget(QWidget):
 
     def _graph_done(self, SA):
         self.SA = SA
+        self._deleted_stack = []
+        self._update_stats()
+        if self._is_wires():
+            if self.g_view.currentIndex() == 0:
+                self.g_view.setCurrentIndex(2)
+        elif self.g_view.currentIndex() == 2:
+            self.g_view.setCurrentIndex(1)
+        if self.g_skeleton.isChecked():
+            self._toggle_skeleton(True)
+        self.draw_graph()
+        self._say("Graph extracted. Next: export it below.")
+
+    def _update_stats(self):
+        SA = self.SA
         G, L = SA.G, SA.L
         n_vin = sum(1 for n in L if isinstance(n, str) and n.startswith("Vin_")) if self._is_wires() \
             else sum(1 for n in G if isinstance(n, str) and n.startswith("Vin_"))
@@ -1184,20 +1215,82 @@ class Pics2GraphWidget(QWidget):
                 lq, wq = st["length_q"], st["width_q"]
                 txt += (f"\nLength (complete wires) median {lq[1]:.0f} px [{lq[0]:.0f}-{lq[2]:.0f}], "
                         f"width {wq[1]:.2f} px; {st['n_truncated']} wires truncated")
-            if self.g_view.currentIndex() == 0:
-                self.g_view.setCurrentIndex(2)
+            if SA.removed_wires:
+                txt += f"\n{len(SA.removed_wires)} wires deleted by hand"
         else:
             txt = (f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n"
                    f"L: {L.number_of_nodes()} nodes, {L.number_of_edges()} edges")
-            if self.g_view.currentIndex() == 2:
-                self.g_view.setCurrentIndex(1)
         if n_vin or n_vout:
             txt += f"\nElectrode contacts: {n_vin} Vin, {n_vout} Vout"
         self.g_stats.setText(txt)
-        if self.g_skeleton.isChecked():
-            self._toggle_skeleton(True)
+
+    # ------------------------------------------------------ deleting wires by hand
+    def _toggle_delete_mode(self, on):
+        cbs = self.viewer.mouse_drag_callbacks
+        if on:
+            if not self._is_wires():
+                self._say("Extract the graph with wire tracing first.", "warning")
+                self.btn_delete.setChecked(False)
+                return
+            if self.g_view.currentIndex() != 2:
+                self.g_view.setCurrentIndex(2)
+            if self._on_click_delete not in cbs:
+                cbs.append(self._on_click_delete)
+            # pan/zoom mode in the selected layer, so the click does not paint
+            layer = self._layer(WIRES)
+            if layer is not None:
+                self.viewer.layers.selection.active = layer
+                layer.mode = "pan_zoom"
+            self._say("Click on a wire to delete it. Press the button again to stop.")
+        else:
+            if self._on_click_delete in cbs:
+                cbs.remove(self._on_click_delete)
+            self._say("Deleting finished.")
+
+    def _on_click_delete(self, viewer, event):
+        if event.type != "mouse_press" or not self.btn_delete.isChecked():
+            return
+        y, x = event.position[-2:]
+        self.delete_wire_at(x, y)
+
+    def delete_wire_at(self, x, y):
+        """Delete the wire under (x, y), in image coordinates."""
+        SA = self.SA
+        if not self._is_wires():
+            return None
+        i = SA.wire_at(x, y)
+        if i is None:
+            self.status.setText("No wire there (click on the center of a colored wire).")
+            return None
+        before = set(SA.L.nodes)
+        SA.remove_wires([i])
+        self._deleted_stack.append(i)
+        lost = sum(1 for n in before - set(SA.L.nodes) if not isinstance(n, str)) - 1
+        self._update_stats()
         self.draw_graph()
-        self._say("Graph extracted. Next: export it below.")
+        self.status.setText(f"Wire {i} deleted" + (f"; {lost} more wires were left with fewer "
+                            "than two contacts and turned gray." if lost > 0 else ".")
+                            + " Undo restores it.")
+        return i
+
+    def undo_delete(self):
+        if not self._is_wires() or not self._deleted_stack:
+            return
+        i = self._deleted_stack.pop()
+        self.SA.restore_wires([i])
+        self._update_stats()
+        self.draw_graph()
+        self.status.setText(f"Wire {i} restored.")
+
+    def restore_deleted(self):
+        if not self._is_wires() or not self.SA.removed_wires:
+            return
+        n = len(self.SA.removed_wires)
+        self.SA.restore_wires()
+        self._deleted_stack = []
+        self._update_stats()
+        self.draw_graph()
+        self.status.setText(f"{n} deleted wires restored.")
 
     def _is_wires(self):
         return self.SA is not None and hasattr(self.SA, "wires")
@@ -1216,7 +1309,7 @@ class Pics2GraphWidget(QWidget):
             keep = [n for n in SA.L.nodes if not isinstance(n, str)]
             thick = max(1, int(round(SA.wire_width)))
             kept = set(keep)
-            gone = [i for i in range(len(SA.wires)) if i not in kept]
+            gone = [i for i in range(len(SA.wires)) if i not in kept and i not in SA.removed_wires]
             if gone:
                 # detected, but left out of the graph by the cleaning (dead ends)
                 dang = SA.wire_label_image(thickness=thick, wires=gone) > 0

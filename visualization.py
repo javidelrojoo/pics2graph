@@ -364,7 +364,8 @@ def plot_wires_on_image(WA, xlim=None, ylim=None, save_path=None, dpi=200, ax=No
     f = _zoom_factor(WA, xlim, ylim, "auto")
     if show_dangling:
         kept = set(keep)
-        gone = [np.asarray(p) for i, p in enumerate(WA.wires) if i not in kept]
+        removed = getattr(WA, "removed_wires", set())
+        gone = [np.asarray(p) for i, p in enumerate(WA.wires) if i not in kept and i not in removed]
         ax.add_collection(LineCollection(gone, colors="0.6", linewidths=0.6 * linewidth * f ** 0.5))
     rng = np.random.default_rng(seed)
     colors = rng.uniform(0.25, 1.0, (len(keep), 3))

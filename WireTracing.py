@@ -320,6 +320,7 @@ class WireAnalysis:
             self.img = cv2.GaussianBlur(self.img, (0, 0), max(0.7, 0.4 * self.wire_width))
         self.has_electrodes = False
         self.exclude_mask = None
+        self.removed_wires = set()    # wires deleted by hand (indices into self.wires)
         self.progress = None          # callback(stage, fraction 0-1 overall, detail)
         self._stage = None
         self._last_report = 0.0
@@ -938,6 +939,14 @@ class WireAnalysis:
         ``self.contacts``: list of (i, j, x, y) for every pair of wires in
         contact, and ``self.electrode_contacts``: list of ("Vin"/"Vout", i, x, y).
         """
+        self._wires_changed()
+        return self._find_contacts(contact_distance, end_tolerance)
+
+    def _find_contacts(self, contact_distance=None, end_tolerance=None):
+        """
+        ``self.contacts``: list of (i, j, x, y) for every pair of wires in
+        contact, and ``self.electrode_contacts``: list of ("Vin"/"Vout", i, x, y).
+        """
         w = self.wire_width
         cd = contact_distance if contact_distance is not None else 0.8 * w
         et = end_tolerance if end_tolerance is not None else 1.5 * w
@@ -1166,6 +1175,11 @@ class WireAnalysis:
                     length_q=q(L_ok), length_all_q=q(L_all), width_q=q(Wd), n_width=len(Wd))
 
     # ---------------------------------------------------------------- 5. graphs
+    def _wires_changed(self):
+        """Forget what was cached about the wires (after they are traced or edited)."""
+        self.__dict__.pop("_arc_cache", None)
+        self.__dict__.pop("_path_cache", None)
+
     def build_graphs(self, drop_dangling=True):
         """
         Build ``self.L`` (nodes = wires, edges = contacts) and the spatial graph
@@ -1176,23 +1190,33 @@ class WireAnalysis:
         ``SkeletonAnalysis.clean_network``: a wire touching a single other wire
         cannot carry current). Electrode nodes are always kept.
         """
+        self._drop_dangling = drop_dangling
         L = nx.Graph()
+        removed = getattr(self, "removed_wires", set())
         for i, p in enumerate(self.wires):
+            if i in removed:
+                continue
             p = np.asarray(p)
             c = p.mean(axis=0)
-            path = resample_polyline(p, 3.0)
+            paths = self.__dict__.setdefault("_path_cache", {})
+            if i not in paths:
+                paths[i] = ";".join(f"{x:.1f},{y:.1f}" for x, y in resample_polyline(p, 3.0))
             meas = self.measurements[i] if getattr(self, "measurements", None) else {}
             extra = {k: (float(v) if not isinstance(v, bool) else v) for k, v in meas.items()
                      if k != "length" and not (isinstance(v, float) and np.isnan(v))}
             L.add_node(i, x=float(c[0]), y=float(c[1]), length=polyline_length(p), **extra,
                        x0=float(p[0, 0]), y0=float(p[0, 1]),
                        x1=float(p[-1, 0]), y1=float(p[-1, 1]),
-                       path=";".join(f"{x:.1f},{y:.1f}" for x, y in path))
+                       path=paths[i])
         for i, j, x, y in self.contacts:
+            if i in removed or j in removed:
+                continue
             L.add_edge(i, j, x=float(x), y=float(y))
         self.electrode_pos = {}
         counters = {"Vin": 0, "Vout": 0}
         for name, i, x, y in self.electrode_contacts:
+            if i in removed:
+                continue
             node = f"{name}_{counters[name]}"
             counters[name] += 1
             L.add_node(node, x=float(x), y=float(y))
@@ -1211,6 +1235,44 @@ class WireAnalysis:
         self.G = self._spatial_graph(L)
         return L
 
+    def remove_wires(self, ids, drop_dangling=None):
+        """
+        Delete wires by hand (false detections): they and their contacts leave
+        the graph, which is rebuilt (dangling wires dropped again if the last
+        build dropped them). Undo with ``restore_wires``.
+        """
+        self.removed_wires |= {int(i) for i in ids}
+        self._rebuild(drop_dangling)
+
+    def restore_wires(self, ids=None):
+        """Undo ``remove_wires`` for ``ids`` (all of them if None)."""
+        if ids is None:
+            self.removed_wires = set()
+        else:
+            self.removed_wires -= {int(i) for i in ids}
+        self._rebuild(None)
+
+    def _rebuild(self, drop_dangling):
+        if drop_dangling is None:
+            drop_dangling = getattr(self, "_drop_dangling", True)
+        self.build_graphs(drop_dangling=drop_dangling)
+
+    def wire_at(self, x, y, radius=None):
+        """Index of the wire whose center line passes closest to (x, y), or None."""
+        radius = radius if radius is not None else max(3.0, 1.5 * self.wire_width)
+        best, bd = None, radius
+        for i, p in enumerate(self.wires):
+            if i in self.removed_wires:
+                continue
+            p = np.asarray(p)
+            if (p[:, 0].min() - radius > x or p[:, 0].max() + radius < x or
+                    p[:, 1].min() - radius > y or p[:, 1].max() + radius < y):
+                continue
+            d = np.hypot(*(resample_polyline(p, 1.0) - (x, y)).T).min()
+            if d < bd:
+                best, bd = i, d
+        return best
+
     def _spatial_graph(self, L):
         """Nodes = contacts (and electrode nodes); edges = wire pieces between them."""
         G = nx.Graph()
@@ -1228,12 +1290,19 @@ class WireAnalysis:
             G.add_node(nid)
             on_wire[u].append((d["x"], d["y"], nid))
             on_wire[v].append((d["x"], d["y"], nid))
+        # position of each contact along its wire; cached, as it does not change
+        # when wires are deleted by hand and the graph is rebuilt
+        cache = self.__dict__.setdefault("_arc_cache", {})
         for wire, items in on_wire.items():
             if len(items) < 2:
                 continue
-            p = resample_polyline(self.wires[wire], 1.0)
-            tree = cKDTree(p)
-            order = sorted(items, key=lambda t: tree.query((t[0], t[1]))[1])
+            missing = [t for t in items if (wire, t[0], t[1]) not in cache]
+            if missing:
+                p = resample_polyline(self.wires[wire], 1.0)
+                _, idx = cKDTree(p).query([(t[0], t[1]) for t in missing])
+                for t, k in zip(missing, np.atleast_1d(idx)):
+                    cache[(wire, t[0], t[1])] = int(k)
+            order = sorted(items, key=lambda t: cache[(wire, t[0], t[1])])
             for (_, _, a), (_, _, b) in zip(order[:-1], order[1:]):
                 if a != b:
                     G.add_edge(a, b, wire=int(wire))
