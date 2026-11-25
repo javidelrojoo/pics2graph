@@ -877,36 +877,113 @@ class WireAnalysis:
         self.wires = [p for p in wires if polyline_length(p) >= self.min_length]
         return self.wires
 
+    def _low_background(self):
+        """
+        Level of the dark background around every pixel: the darkest value
+        (of the slightly smoothed image) within ~5 wire widths, smoothed.
+        Unlike a grayscale opening it does not rise inside bundles of wires,
+        where the gaps between them are still dark. Kept at a reduced
+        resolution (``self._lowbg``, ``self._lowbg_f``).
+        """
+        if getattr(self, "_lowbg", None) is not None:
+            return self._lowbg, self._lowbg_f
+        w = self.wire_width
+        f = max(1, int(w // 1.5))
+        img = self.img.astype(np.float32)
+        H, W = img.shape
+        small = cv2.resize(img, (max(1, W // f), max(1, H // f)), interpolation=cv2.INTER_AREA) \
+            if f > 1 else img
+        small = cv2.GaussianBlur(small, (0, 0), 1.0)
+        r = max(2, int(np.ceil(5 * w / f)))
+        low = cv2.erode(small, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        low = cv2.GaussianBlur(low, (0, 0), r / 2)
+        self._lowbg, self._lowbg_f = low, f
+        return low, f
+
     def _contrast_sampler(self, pts, margin):
         """
         Around the points ``pts``: a function ``f(q) -> (gray, background)``
-        that samples (bilinear) the image and its local background (grayscale
-        opening a bit wider than a wire) at float positions. Unlike the ridge
-        response, the image does not leak along a wire past its tip.
+        that samples (bilinear) the image and the dark background level
+        (``_low_background``) at float positions. Unlike the ridge response,
+        the image does not leak along a wire past its tip or across a gap.
         """
         H, W = self.img.shape
-        r = int(round(1.5 * self.wire_width)) + 1
-        m = int(np.ceil(margin)) + r + 2
+        m = int(np.ceil(margin)) + 3
         x0, y0 = max(int(pts[:, 0].min()) - m, 0), max(int(pts[:, 1].min()) - m, 0)
         x1, y1 = min(int(pts[:, 0].max()) + m + 1, W), min(int(pts[:, 1].max()) + m + 1, H)
         sub = self.img[y0:y1, x0:x1].astype(np.float32)
-        bg = cv2.morphologyEx(sub, cv2.MORPH_OPEN,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        low, f = self._low_background()
         h, w_ = sub.shape
+        lh, lw = low.shape
 
-        def bil(a, x, y, xi, yi, fx, fy):
-            return ((a[yi, xi] * (1 - fx) + a[yi, xi + 1] * fx) * (1 - fy)
-                    + (a[yi + 1, xi] * (1 - fx) + a[yi + 1, xi + 1] * fx) * fy)
+        def bil(a, x, y):
+            hh, ww = a.shape
+            x = np.clip(x, 0, max(ww - 1.001, 0))
+            y = np.clip(y, 0, max(hh - 1.001, 0))
+            xi = np.minimum(x.astype(int), max(ww - 2, 0))
+            yi = np.minimum(y.astype(int), max(hh - 2, 0))
+            fx, fy = x - xi, y - yi
+            xj, yj = np.minimum(xi + 1, ww - 1), np.minimum(yi + 1, hh - 1)
+            return ((a[yi, xi] * (1 - fx) + a[yi, xj] * fx) * (1 - fy)
+                    + (a[yj, xi] * (1 - fx) + a[yj, xj] * fx) * fy)
 
         def sample(q):
             q = np.atleast_2d(q)
-            x = np.clip(q[:, 0] - x0, 0, max(w_ - 1.001, 0))
-            y = np.clip(q[:, 1] - y0, 0, max(h - 1.001, 0))
-            xi, yi = x.astype(int), y.astype(int)
-            xi, yi = np.minimum(xi, w_ - 2), np.minimum(yi, h - 2)
-            fx, fy = x - xi, y - yi
-            return bil(sub, x, y, xi, yi, fx, fy), bil(bg, x, y, xi, yi, fx, fy)
+            return (bil(sub, q[:, 0] - x0, q[:, 1] - y0),
+                    bil(low, (q[:, 0] + 0.5) / f - 0.5, (q[:, 1] + 0.5) / f - 0.5))
         return sample
+
+    def split_at_gaps(self, min_contrast=0.35, gap=None):
+        """
+        Cut the wires where the image shows no wire: a stretch of at least
+        ``gap`` px (default max(2, width)) whose gray level is less than
+        ``min_contrast`` x the wire's own contrast above the local background.
+
+        The ridge filters are elongated and the tracer bridges short dim
+        stretches (``max_gap``), and joining links aligned pieces, so a trace
+        can run on from one wire to another across a dark gap. Each piece
+        becomes a wire of its own; pieces shorter than ``min_length`` are
+        dropped. Returns the number of cuts (also ``self.n_split``).
+        """
+        w = self.wire_width
+        gap = gap if gap is not None else max(2.0, w)
+        ds = 0.5
+        n_gap = max(1, int(round(gap / ds)))
+        min_len = getattr(self, "min_length", 0) or 0
+        out, cuts = [], 0
+        n_w = len(self.wires)
+        for i, p in enumerate(self.wires):
+            if i % 500 == 0:
+                self._report("Closing gaps at wire ends", 0.0, f"checking wire {i} of {n_w}")
+            p = np.asarray(p, float)
+            s = resample_polyline(p, ds)
+            if len(s) < 2 * n_gap + 4:
+                out.append(p)
+                continue
+            g, bg = self._contrast_sampler(s, 2)(s)
+            ref = float(np.median(g - bg))
+            if not ref > 0:
+                out.append(p)
+                continue
+            dark = (g - bg) < min_contrast * ref
+            d = np.diff(np.r_[0, dark.astype(np.int8), 0])
+            starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+            keep = np.ones(len(s), bool)
+            for a, e in zip(starts, ends):
+                if e - a >= n_gap:
+                    keep[a:e] = False
+            if keep.all():
+                out.append(p)
+                continue
+            d = np.diff(np.r_[0, keep.astype(np.int8), 0])
+            pieces = [s[a:e] for a, e in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))]
+            interior = sum(1 for a, e in zip(starts, ends) if e - a >= n_gap and a > 0 and e < len(s))
+            cuts += interior
+            out.extend(q for q in pieces if len(q) >= 2 and polyline_length(q) >= min_len)
+        self.wires = out
+        self.n_split = cuts
+        self._wires_changed()
+        return cuts
 
     def extend_ends(self, max_extension=None, min_contrast=0.5, max_trim=None, gap=1.5):
         """
@@ -967,8 +1044,7 @@ class WireAnalysis:
             g, bg = smp(s)
             ref = float(np.median(g - bg))
             m = min(int(max_trim / ds), len(s) // 3)
-            # background level near each end (a bright blob the wire runs
-            # into is not background: the raw gray level is compared to it)
+            # dark background level near each end
             bends = (float(np.median(bg[:m + 1])), float(np.median(bg[len(s) - 1 - m:])))
             refs.append((ref, bends))
             if not ref > 0 or len(s) < 4 * n_gap:
@@ -1481,7 +1557,7 @@ class WireAnalysis:
         """Drop the cached orientation scores and the occupancy map."""
         if hasattr(self, "_cache"):
             self._cache.clear()
-        for a in ("occupancy", "_cont", "_bg"):
+        for a in ("occupancy", "_cont", "_bg", "_lowbg"):
             if hasattr(self, a):
                 delattr(self, a)
 
@@ -1490,6 +1566,7 @@ class WireAnalysis:
                           n_orientations=16, seed_threshold=None, low_threshold=None,
                           max_gap=2, join_distance=None, min_length=None,
                           contact_distance=None, end_tolerance=None, extend_ends=True,
+                          split_gaps=True,
                           continuity_length=None, exclude_mask=None, pixel_size=None,
                           keep_scores=False, verbose=False, progress=None):
         """
@@ -1523,6 +1600,10 @@ class WireAnalysis:
         self._report("Joining pieces of wires", 0, f"{len(self.raw_wires)} pieces", force=True)
         self.join(max_distance=join_distance)
         log(f"Joined into {len(self.wires)} wires.")
+        if split_gaps:
+            self._report("Closing gaps at wire ends", 0, f"{len(self.wires)} wires", force=True)
+            n = self.split_at_gaps()
+            log(f"Cut {n} wires where the trace crossed a dark gap ({len(self.wires)} wires).")
         if extend_ends:
             self._report("Closing gaps at wire ends", 0, f"{len(self.wires)} wires", force=True)
             n = self.extend_ends()
