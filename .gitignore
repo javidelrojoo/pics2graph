@@ -6,3 +6,5 @@ venv/
 # generated outputs
 *.graphml
 *_graph.png
+Claude outputs/
+*_wires.png
