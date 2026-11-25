@@ -44,7 +44,7 @@ from qtpy.QtGui import QColor, QFont, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
-    QSpinBox, QSplashScreen, QTabWidget, QVBoxLayout, QWidget,
+    QProgressBar, QSpinBox, QSplashScreen, QTabWidget, QVBoxLayout, QWidget,
 )
 
 _T0 = time.time()
@@ -239,10 +239,20 @@ class Pics2GraphWidget(QWidget):
 
         self.status = QLabel("Open a micrograph, a binary image, or stitch a folder of tiles.")
         self.status.setWordWrap(True)
+        # Progress of long tasks that report it (wire tracing)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.hide()
+        self._progress_state = None
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(200)
+        self._progress_timer.timeout.connect(self._show_progress)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.tabs)
         layout.addWidget(self.status)
+        layout.addWidget(self.progress_bar)
         self.setMinimumWidth(400)
 
     # -------------------------------------------------------------------------
@@ -268,8 +278,42 @@ class Pics2GraphWidget(QWidget):
                 return layer.data.shape[:2]
         return None
 
-    def _run(self, fn, on_done, button, busy_msg):
-        """Run ``fn`` in a background thread, then ``on_done(result)`` in the GUI."""
+    def _show_progress(self):
+        st = self._progress_state
+        if not st or "frac" not in st:
+            return
+        import time
+        frac, stage, detail = st["frac"], st["stage"], st["detail"]
+        el = time.time() - st["t0"]
+        txt = f"{stage}: {detail}" if detail else stage
+        if frac > 0.05:
+            left = el * (1 - frac) / frac
+            txt += f"  ({el:.0f} s, about {left:.0f} s left)"
+        else:
+            txt += f"  ({el:.0f} s)"
+        self.status.setText(txt)
+        self.progress_bar.setValue(int(round(1000 * frac)))
+        self.progress_bar.setFormat(f"{100 * frac:.0f} %  {stage}")
+
+    def _progress_callback(self):
+        """
+        A thread-safe progress(stage, fraction, detail) for a background job:
+        it only stores the latest values, and a timer shows them in the GUI.
+        """
+        import time
+        state = {"t0": time.time()}
+        self._progress_state = state
+
+        def cb(stage, frac, detail=""):
+            state.update(stage=stage, frac=frac, detail=detail)
+        return cb
+
+    def _run(self, fn, on_done, button, busy_msg, progress=False):
+        """
+        Run ``fn`` in a background thread, then ``on_done(result)`` in the GUI.
+        With ``progress`` a progress bar shows what the job reports through
+        the callback from ``_progress_callback``.
+        """
         # ignore_errors: errors are shown by _errored below instead of being
         # re-raised in the GUI thread (which would close the whole program)
         worker = thread_worker(fn, ignore_errors=True)()
@@ -279,7 +323,17 @@ class Pics2GraphWidget(QWidget):
         def _errored(e):
             self._say(f"{type(e).__name__}: {e}", "error")
 
+        if progress:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("starting...")
+            self.progress_bar.show()
+            self._progress_timer.start()
+
         def _finished():
+            if progress:
+                self._progress_timer.stop()
+                self.progress_bar.hide()
+                self._progress_state = None
             button.setEnabled(True)
             if worker in self._workers:
                 self._workers.remove(worker)
@@ -1096,17 +1150,20 @@ class Pics2GraphWidget(QWidget):
         exclude = self.exclusion_mask()
         raw_path = self.raw_path
 
+        progress = self._progress_callback()
+
         def job():
+            progress("Measuring the wire width", 0.0, "on the strongest ridges" if width is None else "")
             WA = WireAnalysis(img=img, wire_width=width, invert=invert)
             WA.original_img_path = raw_path
-            WA.complete_analysis(electrodes_path=masks, clean_network=clean,
+            WA.complete_analysis(electrodes_path=masks, clean_network=clean, progress=progress,
                                  seed_threshold=seed, low_threshold=low, max_gap=gap,
                                  join_distance=join, contact_distance=contact,
                                  exclude_mask=exclude)
             return WA
 
         self._run(job, self._graph_done, self.btn_extract,
-                  "Tracing wires (this can take a minute on large images)...")
+                  "Tracing wires (this can take a minute on large images)...", progress=True)
 
     def _graph_done(self, SA):
         self.SA = SA

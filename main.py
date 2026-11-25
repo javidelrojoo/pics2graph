@@ -150,6 +150,27 @@ def parse_args():
     return p.parse_args()
 
 
+def _console_progress():
+    """progress(stage, fraction, detail) that prints a line every 5 % or so."""
+    import sys
+    import time
+    t0 = time.time()
+    last = {"step": -1}
+    tty = sys.stdout.isatty()
+
+    def cb(stage, frac, detail=""):
+        step = int(frac * 20)
+        if step == last["step"] and frac < 1:
+            return
+        last["step"] = step
+        line = f"  {100 * frac:3.0f} %  {time.time() - t0:5.0f} s  {stage}" + (f": {detail}" if detail else "")
+        if tty:
+            print("\r" + line[:110].ljust(110), end="" if frac < 1 else "\n", flush=True)
+        else:
+            print(line, flush=True)
+    return cb
+
+
 def main():
     args = parse_args()
     verbose = not args.quiet
@@ -201,6 +222,7 @@ def main():
             print("Note: the example in the repo is a binary image; the wire tracing "
                   "is more faithful on the original micrograph (--image path/M4.tif).")
         SA = WireAnalysis(img_path, wire_width=args.wire_width, invert=args.invert)
+        progress = _console_progress() if verbose else None
         if verbose:
             print(f"Wire width: {SA.wire_width:.1f} px.")
         SA.complete_analysis(
@@ -215,6 +237,7 @@ def main():
             exclude_mask=args.exclude,
             pixel_size=args.pixel_size,
             verbose=verbose,
+            progress=progress,
         )
     else:
         SA = SkeletonAnalysis(img_path)

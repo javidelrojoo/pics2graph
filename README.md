@@ -63,7 +63,7 @@ It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the 
 
 Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
 
-Every layer can be hidden, made more transparent or edited with napari's own tools (left panel). Long tasks (stitching, graph extraction) run in the background, so the window stays responsive.
+Every layer can be hidden, made more transparent or edited with napari's own tools (left panel). Long tasks (stitching, graph extraction) run in the background, so the window stays responsive. Wire tracing shows a progress bar with the current stage (filtering, tracing, joining, contacts, measurements), how many wires it has found so far and an estimate of the time left; the command line prints the same every 5 %.
 
 ## Quick start (command line)
 

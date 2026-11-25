@@ -320,7 +320,37 @@ class WireAnalysis:
             self.img = cv2.GaussianBlur(self.img, (0, 0), max(0.7, 0.4 * self.wire_width))
         self.has_electrodes = False
         self.exclude_mask = None
+        self.progress = None          # callback(stage, fraction 0-1 overall, detail)
+        self._stage = None
+        self._last_report = 0.0
         self.wires = []
+
+    # --------------------------------------------------------------- progress
+    # Share of the total time of each stage (measured on M1/M3/M4 sized images)
+    STAGES = [("Filtering the image", 0.15), ("Tracing wires", 0.63),
+              ("Joining pieces of wires", 0.05), ("Closing gaps at wire ends", 0.04),
+              ("Finding contacts", 0.05), ("Measuring wires", 0.06),
+              ("Building the graph", 0.02)]
+
+    def _report(self, stage, frac=0.0, detail="", force=False):
+        """Send progress to ``self.progress`` (at most ~4 times per second)."""
+        if self.progress is None:
+            return
+        import time
+        now = time.time()
+        if not force and stage == self._stage and now - self._last_report < 0.25:
+            return
+        self._stage, self._last_report = stage, now
+        done, share = 0.0, 0.0
+        for name, w in self.STAGES:
+            if name == stage:
+                share = w
+                break
+            done += w
+        try:
+            self.progress(stage, min(1.0, done + share * min(max(frac, 0.0), 1.0)), detail)
+        except Exception:
+            pass                        # a broken display must not stop the analysis
 
     # ------------------------------------------------------------------ input
     def load_electrodes(self, path1, path2):
@@ -402,8 +432,11 @@ class WireAnalysis:
         self.R_max = np.zeros((H, W), np.float16)
         self.R_arg = np.zeros((H, W), np.uint8)
         self.R_perp = np.zeros((H, W), np.float16)
-        for ty in range((H + T - 1) // T):
-            for tx in range((W + T - 1) // T):
+        n_ty, n_tx = (H + T - 1) // T, (W + T - 1) // T
+        self._report("Filtering the image", 0.0, f"{K} orientations", force=True)
+        for ty in range(n_ty):
+            for tx in range(n_tx):
+                self._setup_block = (ty * n_tx + tx, n_ty * n_tx)
                 R = self._get_tile(ty, tx)
                 h, w_ = min(T, H - ty * T), min(T, W - tx * T)
                 r = R[:, :h, :w_]
@@ -415,6 +448,7 @@ class WireAnalysis:
                 # as R_max on a round spot (dust, a particle, a blurred dot)
                 perp = ((arg.astype(np.intp) + K // 2) % K)[None]
                 self.R_perp[sl_] = np.take_along_axis(r, perp, 0)[0]
+        self._setup_block = None
         # Noise of the response, in the same units (for automatic thresholds)
         knorm = float(np.sqrt((self._kernels[0] ** 2).sum()))
         self.noise = estimate_noise(self.img) * knorm
@@ -439,7 +473,13 @@ class WireAnalysis:
             crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_REFLECT)
         h, w_ = y1 - y0, x1 - x0
         R = np.zeros((self.n_orientations, h + 1, w_ + 1), np.float16)
+        blk = getattr(self, "_setup_block", None)
         for k, ker in enumerate(self._kernels):
+            if blk is not None:
+                b, nb = blk
+                self._report("Filtering the image", (b + k / len(self._kernels)) / nb,
+                             f"orientation {k + 1} of {len(self._kernels)}"
+                             + (f", block {b + 1} of {nb}" if nb > 1 else ""))
             r = cv2.filter2D(crop, cv2.CV_32F, ker, borderType=cv2.BORDER_CONSTANT)
             R[k, :h, :w_] = np.maximum(r[P:P + h, P:P + w_], 0)
         if self._inside is not None:
@@ -683,7 +723,12 @@ class WireAnalysis:
         max_steps = int(max_length / step)
         max_turn = np.deg2rad(max_turn_deg)
         wires = []
-        for idx in order:
+        n_seeds = len(order)
+        self._report("Tracing wires", 0.0, f"{n_seeds} starting points", force=True)
+        for n_done, idx in enumerate(order):
+            if n_done % 200 == 0:
+                self._report("Tracing wires", n_done / max(n_seeds, 1),
+                             f"{len(wires)} wires so far, starting point {n_done} of {n_seeds}")
             y, x = ys[idx], xs[idx]
             k = int(self.R_arg[y, x])
             if self._occupied(k, x, y):
@@ -1239,14 +1284,21 @@ class WireAnalysis:
                           max_gap=2, join_distance=None, min_length=None,
                           contact_distance=None, end_tolerance=None, extend_ends=True,
                           continuity_length=None, exclude_mask=None, pixel_size=None,
-                          keep_scores=False, verbose=False):
-        """Run the whole pipeline. Returns ``self.L``."""
+                          keep_scores=False, verbose=False, progress=None):
+        """
+        Run the whole pipeline. Returns ``self.L``. ``progress``, if given, is
+        called as ``progress(stage, fraction, detail)`` while it runs
+        (fraction of the whole analysis, 0 to 1), a few times per second.
+        """
         import time
         t0 = time.time()
 
         def log(msg):
             if verbose:
                 print(f"[{time.time() - t0:6.1f} s] {msg}")
+
+        if progress is not None:
+            self.progress = progress
 
         if electrodes_path:
             self.load_electrodes(*electrodes_path)
@@ -1261,15 +1313,20 @@ class WireAnalysis:
                    max_gap=max_gap, min_length=min_length)
         log(f"Traced {len(self.raw_wires)} pieces "
             f"(seed >= {self.seed_threshold:.1f}, continue >= {self.low_threshold:.1f}).")
+        self._report("Joining pieces of wires", 0, f"{len(self.raw_wires)} pieces", force=True)
         self.join(max_distance=join_distance)
         log(f"Joined into {len(self.wires)} wires.")
         if extend_ends:
+            self._report("Closing gaps at wire ends", 0, f"{len(self.wires)} wires", force=True)
             n = self.extend_ends()
             log(f"Extended {n} wire ends up to the wire they run into.")
+        self._report("Finding contacts", 0, f"{len(self.wires)} wires", force=True)
         self.find_contacts(contact_distance=contact_distance, end_tolerance=end_tolerance)
         log(f"{len(self.contacts)} wire-wire contacts, "
             f"{len(self.electrode_contacts)} electrode contacts.")
+        self._report("Measuring wires", 0, f"{len(self.wires)} wires", force=True)
         self.measure_wires(pixel_size=pixel_size)
+        self._report("Building the graph", 0, f"{len(self.contacts)} contacts", force=True)
         self.build_graphs(drop_dangling=clean_network)
         log(f"Wire graph: {self.L.number_of_nodes()} nodes, {self.L.number_of_edges()} edges.")
         if not keep_scores:
@@ -1277,4 +1334,5 @@ class WireAnalysis:
         if save_graph_path:
             self.save_graph(save_graph_path)
             log(f"Saved to {save_graph_path}.")
+        self._report("Building the graph", 1.0, "done", force=True)
         return self.L
