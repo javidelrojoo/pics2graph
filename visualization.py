@@ -388,3 +388,71 @@ def plot_wires_on_image(WA, xlim=None, ylim=None, save_path=None, dpi=200, ax=No
     if save_path:
         plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
     return ax
+
+
+def wire_lengths(WA, only_graph=True):
+    """
+    Lengths of the wires measured by ``WA.measure_wires``.
+
+    Returns ``(complete, truncated, unit)``: two arrays with the lengths of the
+    complete wires and of the truncated ones (cut by the border of the image,
+    an electrode or an area to ignore, so their length is only a lower bound),
+    in micrometers when the scale is set (``WA.pixel_size``) and in pixels
+    otherwise. With ``only_graph`` only the wires that are nodes of the line
+    graph ``WA.L`` are counted, as in ``WA.measurement_summary``.
+    """
+    import numpy as np
+
+    if not getattr(WA, "measurements", None):
+        raise ValueError("The wires have not been measured (WireAnalysis.measure_wires).")
+    ids = [n for n in WA.L.nodes if not isinstance(n, str)] if only_graph \
+        else range(len(WA.wires))
+    scale = getattr(WA, "pixel_size", None) or None
+    k = scale or 1.0
+    M = [WA.measurements[i] for i in ids]
+    complete = np.array([m["length"] * k for m in M if not m["truncated"]], dtype=float)
+    truncated = np.array([m["length"] * k for m in M if m["truncated"]], dtype=float)
+    return complete, truncated, ("µm" if scale else "px")
+
+
+def plot_wire_length_histogram(WA, include_truncated=False, bins="auto", ax=None,
+                               save_path=None, dpi=200, only_graph=True):
+    """
+    Histogram of the lengths of the wires of the graph (wire tracing).
+
+    The complete wires are drawn in blue with their median as a dashed line;
+    with ``include_truncated`` the truncated ones (whose length is only a lower
+    bound) are stacked on top in gray. ``bins`` is anything accepted by
+    ``numpy.histogram_bin_edges`` (a number or a rule such as ``"auto"``).
+    Lengths in micrometers when the scale is set, otherwise in pixels.
+    """
+    import numpy as np
+
+    complete, truncated, unit = wire_lengths(WA, only_graph=only_graph)
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4))
+    data = [complete] + ([truncated] if include_truncated and len(truncated) else [])
+    every = np.concatenate(data) if data else np.array([])
+    if len(every) == 0:
+        ax.text(0.5, 0.5, "No wires to show", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        edges = np.histogram_bin_edges(every, bins=bins)
+        colors = ["tab:blue", "0.6"][:len(data)]
+        labels = [f"complete ({len(complete)})", f"truncated ({len(truncated)})"][:len(data)]
+        ax.hist(data, bins=edges, stacked=True, color=colors, label=labels,
+                edgecolor="none")
+        if len(complete):
+            med = float(np.median(complete))
+            ax.axvline(med, color="tab:orange", linestyle="--", linewidth=1.2,
+                       label=f"median {med:.3g} {unit}")
+        ax.legend(frameon=False, fontsize="small")
+        ax.set_xlim(left=0)
+    ax.set_xlabel(f"Wire length ({unit})")
+    ax.set_ylabel("Wires")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if save_path:
+        ax.figure.savefig(save_path, bbox_inches="tight", dpi=dpi)
+    return ax
