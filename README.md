@@ -55,12 +55,22 @@ python gui.py path/to/M5.tif      # open a micrograph directly
 
 On Windows you can also **double-click `pics2graph.bat`** (no need to open a terminal first), or drag an image onto it to open that image. It opens a terminal window that shows the loading progress and any error messages; if the program ends with an error, that window stays open until you press a key. To launch it from the Desktop, right-click `pics2graph.bat` › *Send to* › *Desktop (create shortcut)*.
 
-It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the right, one tab per stage:
+It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the right, with one tab per step. The method is chosen first, at the top of the *Image* tab, and only the steps of that method are shown, numbered in the order to follow; a *Next* button at the bottom of each tab moves on to the following one.
 
-1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal). *Scale*: the pixel size in µm/px, read from the TIFF when it has a calibration, typed, or taken from a picture with the microscope's scale bar (see *Scale* below).
-2. **Binarize** (only needed for the skeleton method): adaptive binarization with live preview while you move *block size*, *C* and the intensity threshold. The result is an editable `binary` layer: select it and use napari's brush (label 1) to add wire pixels or the eraser to remove them. *Save binary image...* exports it.
-3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, load existing masks, or get them **from a later photo** (see *Electrodes from a later photo*). *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
-4. **Graph**: choose the method (*Trace wires on the micrograph*, the default, or *Skeleton of the binary image*), extract the graph (optional cleaning and electrodes), view it over the image with zoom, and export the `.graphml`, a figure or a screenshot. With wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back. The exported `.graphml`, figure and measurements reflect the deletions. The panel shows the median length and width of the wires (in µm too when the scale is set) and *Save wire measurements (.csv)* writes one row per wire. Its parameters (wire width, start/end contrast, gap, join and contact distances) default to *auto*.
+| Wire tracing (default) | Skeleton |
+|---|---|
+| 1. Image | 1. Image |
+| 2. Electrodes (optional) | 2. Binarize |
+| 3. Trace wires | 3. Electrodes (optional) |
+| 4. Results | 4. Skeleton |
+| | 5. Results |
+
+* **Image**: choose the method (*Trace wires on the micrograph*, the default, or *Skeleton of the binary image*); open a micrograph (or, with the skeleton method, an already binarized image), or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal). *Scale*: the pixel size in µm/px, read from the TIFF when it has a calibration, typed, or taken from a picture with the microscope's scale bar (see *Scale* below).
+* **Binarize** (skeleton method only): adaptive binarization with live preview while you move *block size*, *C* and the intensity threshold. The result is an editable `binary` layer: select it and use napari's brush (label 1) to add wire pixels or the eraser to remove them. *Save binary image...* exports it.
+* **Electrodes** (optional): paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, load existing masks, or get them **from a later photo** (see *Electrodes from a later photo*). *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
+* **Trace wires** (wire-tracing method): the tracing parameters (wire width, start/end contrast, gap, join and contact distances; all default to *auto*), the areas to ignore (*Paint areas to ignore*, *Draw rectangles to ignore*), cleaning and electrodes, and the *Trace wires* button. When it finishes, the panel moves to *Results*.
+* **Skeleton** (skeleton method): the cleaning before skeletonizing (closing, opening, specks), cleaning and electrodes, and *Extract graph*.
+* **Results**: a summary of the graph and, with wire tracing, the median length and width of the wires (in µm too when the scale is set) and a **histogram of the wire lengths** of the final graph (complete wires; *Include truncated wires* stacks the truncated ones, whose length is only a lower bound, in gray; *Save histogram...* exports it as PNG, PDF or SVG). View the graph over the image with zoom: with wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back; the summary and the histogram follow. Export the `.graphml`, the wire measurements (*Save wire measurements (.csv)*, one row per wire), a figure or a screenshot; all of them reflect the deletions. To change the parameters, go back to the previous tab and extract the graph again.
 
 Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
 
@@ -137,7 +147,7 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` and `width` in 
 | `join_distance` / `--join-distance` | 4 × width | Raise it if wires stay split at crossings; lower it if different wires get chained. |
 | `contact_distance` / `--contact-distance` | 0.8 × width | Distance between center lines counted as contact. |
 | `invert` / `--invert` | off | Wires darker than the background (bright field). |
-| `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI (tab 4): *Paint areas to ignore* with a brush, or *Draw rectangles to ignore* (the shapes layer also takes ellipses and polygons). |
+| `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI (*Trace wires* tab): *Paint areas to ignore* with a brush, or *Draw rectangles to ignore* (the shapes layer also takes ellipses and polygons). |
 
 Wires must be brighter than the background (optical dark field, SEM), otherwise use `invert`. It also accepts a binary image (it is blurred first), but it is more faithful on the original micrograph, where crossing wires can still be told apart. The orientation scores are computed by tiles and cached, so memory stays at a few bytes per pixel even for very large mosaics; the M4 sample (2767 × 2424 px) takes about 20 s.
 
@@ -145,7 +155,7 @@ Wires must be brighter than the background (optical dark field, SEM), otherwise 
 
 * `length` (px) is measured along the center line, without the bridges added at the ends and cutting each tip where the brightness falls below half of the wire's contrast. On the synthetic images it is within 2–3 % of the true length (median) for wires recovered whole. A wire split in pieces by the tracer gives two shorter lengths, so in very dense areas the distribution is biased towards short wires.
 * `truncated` marks wires with an end at the image border, an electrode, an excluded area or an empty mosaic margin: they may continue beyond what is seen, so their length is a lower bound. The printed length statistics leave them out.
-* **Scale.** The tiles of a mosaic are saved without the microscope's overlay, so the scale comes from another picture taken with the same camera and objective that has it (e.g. a single frame with the scale bar). `scalebar.py` finds the bar by itself (the longest thin straight run of one flat saturated color, or of pure white) and gives µm/px = bar length / bar px; the length written on the bar has to be typed. In the GUI: tab 1, *Picture with scale bar...* (the bar found is marked with a cyan line; if it is wrong, draw a line along the bar and press *Use drawn line*). On the command line: `--scale-bar picture.jpg --scale-bar-um 100`, or `--pixel-size` directly. A TIFF calibrated in ImageJ / Fiji (*Set Scale*) is read by itself. If the tiles were reduced before stitching (*Downsample tiles*), the mosaic's pixels are that many times larger: set *Mosaic downsample* (the GUI does it after stitching). The bar is located to ±1 px, i.e. ±0.7 % for a 150 px bar.
+* **Scale.** The tiles of a mosaic are saved without the microscope's overlay, so the scale comes from another picture taken with the same camera and objective that has it (e.g. a single frame with the scale bar). `scalebar.py` finds the bar by itself (the longest thin straight run of one flat saturated color, or of pure white) and gives µm/px = bar length / bar px; the length written on the bar has to be typed. In the GUI: *Image* tab, *Picture with scale bar...* (the bar found is marked with a cyan line; if it is wrong, draw a line along the bar and press *Use drawn line*). On the command line: `--scale-bar picture.jpg --scale-bar-um 100`, or `--pixel-size` directly. A TIFF calibrated in ImageJ / Fiji (*Set Scale*) is read by itself. If the tiles were reduced before stitching (*Downsample tiles*), the mosaic's pixels are that many times larger: set *Mosaic downsample* (the GUI does it after stitching). The bar is located to ±1 px, i.e. ±0.7 % for a 150 px bar.
 * `width` (px) is the full width at half maximum of the intensity profile across the wire (median along it), measured only where no other wire is closer than 2 widths, so dense networks give it for a fraction of the wires. **In optical images of nanowires thinner than the resolution it is the width of the blurred image, not the diameter**: it tells the resolution and the focus, not the wire. It is meaningful as a diameter in SEM images where wires are many pixels wide.
 
 **How faithful is it?** `benchmarks/` generates synthetic dark-field micrographs of curved wires with known positions (`synthetic.py`) and scores each method against them (`evaluate.py`). *Whole wires* is the fraction of the true wires that are recovered as a single node covering at least 80 % of their length; *nodes / wire* is the mean number of nodes on each recovered wire (1 is ideal); *spurious* are nodes that do not lie on a single wire (for wire tracing, mostly two wires chained together where one ends next to the other).
@@ -170,7 +180,7 @@ Limitations: two wires crossing at a very shallow angle, or lying side by side o
 
 The defaults (`block_size=151, C=15, intensity_thresh=55`, opening of radius 1) were made for **optical dark-field** micrographs, where the background is close to black. They do **not** work for SEM images: the background is mid-gray, so `C=15` (threshold *below* the local mean) marks most of it as wire (in tests only 24 % of the detected "wire" pixels were real).
 
-Starting points for SEM images of AgNW networks (Zeiss, 8192 × 6144 px tiles, wires 4–6 px wide at full resolution), available as presets in the GUI (tab 2):
+Starting points for SEM images of AgNW networks (Zeiss, 8192 × 6144 px tiles, wires 4–6 px wide at full resolution), available as presets in the GUI (*Binarize* tab):
 
 | Preset | block size | C | intensity threshold | closing radius | opening radius | remove specks (px) |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -205,7 +215,7 @@ python electrode_registration.py JTA_Ag_O3.tif JTA_Ag_O3_electrodes.JPG --scale 
 python electrode_registration.py -h
 ```
 
-In the GUI (tab 3, *From a later photo*): choose the photo, the scale (image px per photo px, e.g. 2 for a 5× photo on a 10× mosaic, or *auto*) and how the electrodes look, then *Align photo & detect electrodes*. The electrodes layer is filled and the aligned photo is added as a semi-transparent layer to check them; touch them up with the drawing tools and *Save masks...*.
+In the GUI (*Electrodes* tab, *From a later photo*): choose the photo, the scale (image px per photo px, e.g. 2 for a 5× photo on a 10× mosaic, or *auto*) and how the electrodes look, then *Align photo & detect electrodes*. The electrodes layer is filled and the aligned photo is added as a semi-transparent layer to check them; touch them up with the drawing tools and *Save masks...*.
 
 From Python: `electrodes_from_photo(image, photo, scale=None, feature="auto", sigma=15)` returns `(mask1, mask2, info)`; `info` holds the transform `M`, `scale`, `rotation_deg`, the number of consistent matches, the residual and warnings. Lower-level pieces: `register`, `detect_electrodes`, `warp_mask`, `warp_photo`, `check_image`.
 
@@ -390,8 +400,9 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`plot_line_graph_on_image(SA, ...)`**: same, for the line graph (each node at the centroid of its wire).
 * **`get_node_positions(SA)`** / **`get_line_graph_positions(SA)`**: `(x, y)` node positions for plotting with networkx.
 * **`plot_wires_on_image(WA, ...)`**: each wire of a `WireAnalysis` in its own color over the micrograph, with contacts (white) and electrode contacts (red / blue).
+* **`plot_wire_length_histogram(WA, include_truncated=False, bins="auto", ax=None, save_path=None)`**: histogram of the lengths of the wires of the graph (after `measure_wires`, which `complete_analysis` runs), in µm when the scale is set and in px otherwise, with the median of the complete wires; with `include_truncated` the truncated wires are stacked in gray. **`wire_lengths(WA)`** returns the lengths themselves: `(complete, truncated, unit)`.
 
-All plotting functions accept either a `SkeletonAnalysis` or a `WireAnalysis`.
+All plotting functions except the histogram accept either a `SkeletonAnalysis` or a `WireAnalysis`.
 
 ## Notes
 

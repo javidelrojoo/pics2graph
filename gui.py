@@ -7,14 +7,25 @@ Graphical interface for pics2graph, built on napari.
     python gui.py                    # empty viewer
     python gui.py path/to/image.tif  # open a micrograph directly
 
-The panel on the right has one tab per stage of the pipeline:
+The panel on the right has one tab per step. The method is chosen first, in
+the Image tab, and only the steps of that method are shown, in order:
 
-    1. Image      - open a micrograph / binary image, or stitch tiles with Fiji.
-    2. Binarize   - adaptive binarization with live preview. The result is an
-                    editable layer: paint to add wire pixels, erase to remove.
-    3. Electrodes - paint (or load) the Vin / Vout electrode masks.
-    4. Graph      - extract the graph, view the spatial graph G or the line
-                    graph L over the image, and export it.
+    Wire tracing (default)          Skeleton
+    1. Image                        1. Image
+    2. Electrodes (optional)        2. Binarize
+    3. Trace wires                  3. Electrodes (optional)
+    4. Results                      4. Skeleton
+                                    5. Results
+
+    Image       - choose the method; open a micrograph (or, for the skeleton
+                  method, a binary image) or stitch tiles with Fiji; scale.
+    Binarize    - adaptive binarization with live preview. The result is an
+                  editable layer: paint to add wire pixels, erase to remove.
+    Electrodes  - paint, load or detect the Vin / Vout electrode masks.
+    Trace wires - wire-tracing parameters, areas to ignore, trace.
+    Skeleton    - cleaning before skeletonizing, extract the graph.
+    Results     - summary, histogram of the wire lengths, view the graph over
+                  the image, delete wires by hand, export.
 
 Every layer can be toggled, zoomed and edited with napari's own tools; the
 panel only adds the pipeline steps on top.
@@ -61,6 +72,7 @@ def _load_modules(report=print):
     global pre, st, er, SkeletonAnalysis, WireAnalysis
     global get_line_graph_positions, get_node_positions
     global plot_line_graph_on_image, plot_network_on_image, plot_wires_on_image
+    global plot_wire_length_histogram
     if _LOADED:
         return
 
@@ -85,7 +97,7 @@ def _load_modules(report=print):
     import electrode_registration as er
     from visualization import (get_line_graph_positions, get_node_positions,
                                plot_line_graph_on_image, plot_network_on_image,
-                               plot_wires_on_image)
+                               plot_wire_length_histogram, plot_wires_on_image)
     _LOADED = True
 
 # Layer names
@@ -221,6 +233,14 @@ def _scrollable(widget):
 #  Main panel
 # =============================================================================
 class Pics2GraphWidget(QWidget):
+    # Steps (tabs) of each method, in the order to follow
+    STEPS = {
+        0: ("image", "electrodes", "trace", "results"),                # wire tracing
+        1: ("image", "binarize", "electrodes", "skeleton", "results"),  # skeleton
+    }
+    TAB_TITLES = {"image": "Image", "binarize": "Binarize", "electrodes": "Electrodes",
+                  "trace": "Trace wires", "skeleton": "Skeleton", "results": "Results"}
+
     def __init__(self, viewer):
         super().__init__()
         self.viewer = viewer
@@ -234,13 +254,23 @@ class Pics2GraphWidget(QWidget):
         self._preview_timer.setInterval(300)
         self._preview_timer.timeout.connect(self.binarize)
 
+        # One page per step; only those of the chosen method are shown as tabs
+        self._next_buttons = {}
+        self._extract_slots = {}
+        self._build_extract_box()
+        self._pages = {
+            "image": _scrollable(self._build_image_tab()),
+            "binarize": _scrollable(self._build_binarize_tab()),
+            "electrodes": _scrollable(self._build_electrodes_tab()),
+            "trace": _scrollable(self._build_trace_tab()),
+            "skeleton": _scrollable(self._build_skeleton_tab()),
+            "results": _scrollable(self._build_results_tab()),
+        }
         self.tabs = QTabWidget()
-        self.tabs.addTab(_scrollable(self._build_image_tab()), "1. Image")
-        self.tabs.addTab(_scrollable(self._build_binarize_tab()), "2. Binarize")
-        self.tabs.addTab(_scrollable(self._build_electrodes_tab()), "3. Electrodes")
-        self.tabs.addTab(_scrollable(self._build_graph_tab()), "4. Graph")
+        self.g_method.currentIndexChanged.connect(self._update_method)
+        self._update_method()
 
-        self.status = QLabel("Open a micrograph, a binary image, or stitch a folder of tiles.")
+        self.status = QLabel("Choose the method, then open a micrograph or stitch a folder of tiles.")
         self.status.setWordWrap(True)
         # Progress of long tasks that report it (wire tracing)
         self.progress_bar = QProgressBar()
@@ -376,20 +406,36 @@ class Pics2GraphWidget(QWidget):
         return row, edit
 
     # -------------------------------------------------------------------------
-    #  Tab 1: Image / stitching
+    #  Image / stitching
     # -------------------------------------------------------------------------
     def _build_image_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
 
+        box = QGroupBox("Method")
+        v = QVBoxLayout(box)
+        self.g_method = _combo(["Trace wires on the micrograph (node = whole wire)",
+                                "Skeleton of the binary image (node = wire segment)"])
+        self.g_method.setToolTip(
+            "Trace wires: follows each wire on the grayscale micrograph, without binarizing\n"
+            "or skeletonizing it; wires keep their identity through crossings, so each node\n"
+            "of the graph is a whole wire.\n"
+            "Skeleton: the original pipeline (binary image -> skeleton -> graph).\n"
+            "The tabs below show the steps of the chosen method.")
+        self.method_help = QLabel()
+        self.method_help.setWordWrap(True)
+        v.addWidget(self.g_method)
+        v.addWidget(self.method_help)
+        lay.addWidget(box)
+
         box = QGroupBox("Open")
         b = QVBoxLayout(box)
         btn_raw = QPushButton("Open micrograph...")
         btn_raw.clicked.connect(self._ask_open_raw)
-        btn_bin = QPushButton("Open binary image (skip binarization)...")
-        btn_bin.clicked.connect(self._ask_open_binary)
+        self.btn_open_bin = QPushButton("Open binary image (skip binarization)...")
+        self.btn_open_bin.clicked.connect(self._ask_open_binary)
         b.addWidget(btn_raw)
-        b.addWidget(btn_bin)
+        b.addWidget(self.btn_open_bin)
         lay.addWidget(box)
 
         box = QGroupBox("Scale")
@@ -521,6 +567,7 @@ class Pics2GraphWidget(QWidget):
         rl.addWidget(self.btn_stitch)
         f.addRow(row)
         lay.addWidget(box)
+        lay.addWidget(self._next_button("image"))
         lay.addStretch()
 
         self.st_mode.currentTextChanged.connect(self._update_stitch_mode)
@@ -563,15 +610,15 @@ class Pics2GraphWidget(QWidget):
         if ps:
             self.sc_pixel.setValue(ps)
             msg += f"Scale read from the file: {ps:.4f} \u00b5m/px. "
-        self._say(msg + "Next: 3. Electrodes and 4. Graph (wire tracing), "
-                  "or 2. Binarize for the skeleton method.")
+        self._say(msg + ("Next: Electrodes (optional), then Trace wires." if self._wire_method()
+                         else "Next: Binarize."))
 
     def open_binary(self, path):
         mask = imread(path, cv2.IMREAD_GRAYSCALE) > 0
         self.set_binary(mask)
         if self._layer(RAW) is None:
             self.viewer.reset_view()
-        self._say(f"Opened binary image {os.path.basename(path)}. Next: 3. Electrodes or 4. Graph.")
+        self._say(f"Opened binary image {os.path.basename(path)}. Next: Electrodes (optional), then Skeleton.")
 
     # ------------------------------------------------------------------ scale
     def pixel_size(self):
@@ -713,7 +760,7 @@ class Pics2GraphWidget(QWidget):
         self._say(f"Mosaic saved to {path}. Next: 2. Binarize.")
 
     # -------------------------------------------------------------------------
-    #  Tab 2: Binarize
+    #  Binarize
     # -------------------------------------------------------------------------
     def _build_binarize_tab(self):
         w = QWidget()
@@ -724,7 +771,7 @@ class Pics2GraphWidget(QWidget):
         self.bin_preset = _combo(list(PRESETS))
         self.bin_preset.setToolTip(
             "Starting values for each kind of image. They also set the cleaning\n"
-            "used before skeletonizing (tab 4): thin SEM wires need no opening.")
+            "used before skeletonizing (Skeleton tab): thin SEM wires need no opening.")
         self.bin_preset.currentTextChanged.connect(self.apply_preset)
         f.addRow("Preset", self.bin_preset)
         self.bin_block = _spin(3, 4001, 151, 2)
@@ -760,6 +807,7 @@ class Pics2GraphWidget(QWidget):
         btn.clicked.connect(self.save_binary)
         v.addWidget(btn)
         lay.addWidget(box)
+        lay.addWidget(self._next_button("binarize"))
         lay.addStretch()
         return w
 
@@ -785,7 +833,7 @@ class Pics2GraphWidget(QWidget):
 
     def binarize(self):
         if self.raw_gray is None:
-            self._say("Open a micrograph first (tab 1).", "warning")
+            self._say("Open a micrograph first (Image tab).", "warning")
             return
         block = self.bin_block.value()
         if block % 2 == 0:
@@ -799,7 +847,7 @@ class Pics2GraphWidget(QWidget):
         self.set_binary(mask > 0)
         frac = 100.0 * np.count_nonzero(mask) / mask.size
         self.status.setText(f"Binarized: {frac:.1f} % of pixels are wire. "
-                            "Adjust the parameters or go to 3. Electrodes / 4. Graph.")
+                            "Adjust the parameters, then go on to Electrodes and Skeleton.")
 
     def set_binary(self, mask):
         data = np.asarray(mask, dtype=np.uint8)
@@ -830,7 +878,7 @@ class Pics2GraphWidget(QWidget):
             self._say(f"Binary image saved to {path}.")
 
     # -------------------------------------------------------------------------
-    #  Tab 3: Electrodes
+    #  Electrodes
     # -------------------------------------------------------------------------
     def _build_electrodes_tab(self):
         w = QWidget()
@@ -839,6 +887,7 @@ class Pics2GraphWidget(QWidget):
         box = QGroupBox("Draw")
         v = QVBoxLayout(box)
         help_ = QLabel(
+            "Optional: without electrodes the graph is extracted on its own. "
             "Paint the input electrode (Vin, red) and the output electrode "
             "(Vout, blue) over the image. Use the polygon tool for large areas, "
             "or fill to flood a closed contour.")
@@ -908,6 +957,7 @@ class Pics2GraphWidget(QWidget):
         btn.clicked.connect(self.save_electrodes)
         f.addRow(btn)
         lay.addWidget(box)
+        lay.addWidget(self._next_button("electrodes"))
         lay.addStretch()
         return w
 
@@ -916,7 +966,7 @@ class Pics2GraphWidget(QWidget):
         if layer is None and create:
             shape = self._shape()
             if shape is None:
-                self._say("Open an image first (tab 1).", "warning")
+                self._say("Open an image first (Image tab).", "warning")
                 return None
             layer = self.viewer.add_labels(np.zeros(shape, np.uint8), name=ELECTRODES, opacity=0.4)
             cmap = _label_colormap({VIN: "red", VOUT: "blue"})
@@ -974,7 +1024,7 @@ class Pics2GraphWidget(QWidget):
             self._say("Choose the photo that shows the electrodes.", "warning")
             return
         if self.raw_gray is None:
-            self._say("Open the micrograph of the network first (tab 1): the alignment "
+            self._say("Open the micrograph of the network first (Image tab): the alignment "
                       "needs the image itself, not only the binary one.", "warning")
             return
         image = self.raw_gray
@@ -1046,32 +1096,21 @@ class Pics2GraphWidget(QWidget):
             self._say(f"Saved {base}_electrode_mask1.tif and _electrode_mask2.tif.")
 
     # -------------------------------------------------------------------------
-    #  Tab 4: Graph
+    #  Trace wires (wire-tracing method)
     # -------------------------------------------------------------------------
-    def _build_graph_tab(self):
+    def _build_trace_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
+        intro = QLabel(
+            "Follows each wire on the grayscale micrograph, without binarizing it: wires "
+            "keep their identity through crossings, so each node of the graph is a whole "
+            "wire. Every parameter defaults to auto: trace first and change them only if "
+            "the result needs it.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
 
-        box = QGroupBox("Extract")
-        f = QFormLayout(box)
-        self.g_method = _combo(["Trace wires on the micrograph (node = whole wire)",
-                                "Skeleton of the binary image (node = wire segment)"])
-        self.g_method.setToolTip(
-            "Trace wires: follows each wire on the grayscale micrograph, without binarizing\n"
-            "or skeletonizing it; wires keep their identity through crossings, so each node\n"
-            "of the graph is a whole wire. Uses the binary image only if no micrograph is open.\n"
-            "Skeleton: the original pipeline (tab 2 binary image -> skeleton -> graph).")
-        self.g_method.currentIndexChanged.connect(self._update_method)
-        f.addRow("Method", self.g_method)
-        self.g_clean = QCheckBox("Clean network (drop dangling wires / segments)")
-        self.g_clean.setChecked(True)
-        self.g_clean.setToolTip("Wire tracing: repeatedly remove wires with fewer than two contacts.\n"
-                                "Skeleton: prune degree-1 nodes and collapse degree-2 nodes.")
-        self.g_use_el = QCheckBox("Use electrodes")
-        self.g_use_el.setChecked(True)
-
-        self.g_wire_box = QGroupBox("Wire tracing")
-        wf = QFormLayout(self.g_wire_box)
+        box = QGroupBox("Parameters")
+        wf = QFormLayout(box)
         self.g_width = _dspin(0, 50, 0, 0.1, 1)
         self.g_width.setSpecialValueText("auto")
         self.g_width.setToolTip("Width of a wire in px (auto = measured on the image).")
@@ -1094,6 +1133,21 @@ class Pics2GraphWidget(QWidget):
         self.g_contact.setToolTip("Two wires touch when their center lines come this close (px);\n"
                                   "auto = 0.8 x wire width.")
         self.g_invert = QCheckBox("Wires darker than background (bright field)")
+        wf.addRow("Wire width (px)", self.g_width)
+        wf.addRow("Start contrast", self.g_seed)
+        wf.addRow("End contrast", self.g_low)
+        wf.addRow("Max gap (steps)", self.g_gap)
+        wf.addRow("Join distance (px)", self.g_join)
+        wf.addRow("Contact distance (px)", self.g_contact)
+        wf.addRow(self.g_invert)
+        lay.addWidget(box)
+
+        box = QGroupBox("Areas to ignore (optional)")
+        v = QVBoxLayout(box)
+        help_ = QLabel("Mark dust, rows of dots or substrate outside the network that get "
+                       "traced as wires, then trace again.")
+        help_.setWordWrap(True)
+        v.addWidget(help_)
         self.btn_exclude = QPushButton("Paint areas to ignore")
         self.btn_exclude.setToolTip(
             "Creates the 'areas to ignore' layer and selects the brush: paint over dust,\n"
@@ -1110,19 +1164,31 @@ class Pics2GraphWidget(QWidget):
         self.btn_exclude_clear = QPushButton("Clear")
         self.btn_exclude_clear.setToolTip("Erase the painted areas and the rectangles to ignore.")
         self.btn_exclude_clear.clicked.connect(self.clear_exclusion)
-        wf.addRow("Wire width (px)", self.g_width)
-        wf.addRow("Start contrast", self.g_seed)
-        wf.addRow("End contrast", self.g_low)
-        wf.addRow("Max gap (steps)", self.g_gap)
-        wf.addRow("Join distance (px)", self.g_join)
-        wf.addRow("Contact distance (px)", self.g_contact)
-        wf.addRow(self.g_invert)
-        wf.addRow(_hbox(self.btn_exclude, self.btn_exclude_rect))
-        wf.addRow(self.btn_exclude_clear)
+        v.addWidget(_hbox(self.btn_exclude, self.btn_exclude_rect))
+        v.addWidget(self.btn_exclude_clear)
+        lay.addWidget(box)
 
-        self.g_skel_box = QGroupBox("Skeleton")
-        f_outer = f
-        f = QFormLayout(self.g_skel_box)
+        self._extract_slots["trace"] = QVBoxLayout()
+        lay.addLayout(self._extract_slots["trace"])
+        lay.addWidget(self._next_button("trace"))
+        lay.addStretch()
+        return w
+
+    # -------------------------------------------------------------------------
+    #  Skeleton (skeleton method)
+    # -------------------------------------------------------------------------
+    def _build_skeleton_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        intro = QLabel(
+            "Cleans and skeletonizes the binary image of the Binarize tab (or the one "
+            "opened in the Image tab) and builds the graph of its junctions: each node of "
+            "the line graph L is a wire segment between two junctions.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        box = QGroupBox("Cleaning before skeletonizing")
+        f = QFormLayout(box)
         self.g_opening = _spin(0, 10, 1)
         self.g_opening.setToolTip(
             "Morphological opening before skeletonizing: removes structures thinner than\n"
@@ -1137,17 +1203,77 @@ class Pics2GraphWidget(QWidget):
         f.addRow("Closing radius", self.g_closing)
         f.addRow("Opening radius", self.g_opening)
         f.addRow("Remove specks up to (px)", self.g_min_obj)
-        f = f_outer
-        f.addRow(self.g_wire_box)
-        f.addRow(self.g_skel_box)
+        lay.addWidget(box)
+
+        self._extract_slots["skeleton"] = QVBoxLayout()
+        lay.addLayout(self._extract_slots["skeleton"])
+        lay.addWidget(self._next_button("skeleton"))
+        lay.addStretch()
+        return w
+
+    def _build_extract_box(self):
+        """Options and button shared by both methods; shown in the tab of the chosen one."""
+        box = QGroupBox("Extract the graph")
+        f = QFormLayout(box)
+        self.g_clean = QCheckBox("Clean network (drop dangling wires / segments)")
+        self.g_clean.setChecked(True)
+        self.g_clean.setToolTip("Wire tracing: repeatedly remove wires with fewer than two contacts.\n"
+                                "Skeleton: prune degree-1 nodes and collapse degree-2 nodes.")
+        self.g_use_el = QCheckBox("Use electrodes")
+        self.g_use_el.setChecked(True)
+        self.g_use_el.setToolTip("Connect the graph to the Vin / Vout electrodes of the Electrodes tab.")
+        self.btn_extract = QPushButton("Trace wires")
+        self.btn_extract.clicked.connect(self.extract_graph)
         f.addRow(self.g_clean)
         f.addRow(self.g_use_el)
-        self.btn_extract = QPushButton("Extract graph")
-        self.btn_extract.clicked.connect(self.extract_graph)
         f.addRow(self.btn_extract)
-        self.g_stats = QLabel("")
+        self.extract_box = box
+
+    # -------------------------------------------------------------------------
+    #  Results: view, edit and export the graph
+    # -------------------------------------------------------------------------
+    def _build_results_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        box = QGroupBox("Summary")
+        v = QVBoxLayout(box)
+        self.g_stats = QLabel("Nothing extracted yet.")
         self.g_stats.setWordWrap(True)
-        f.addRow(self.g_stats)
+        self.g_stats.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        v.addWidget(self.g_stats)
+        lay.addWidget(box)
+
+        self.g_hist_box = box = QGroupBox("Wire lengths")
+        v = QVBoxLayout(box)
+        self.hist_canvas = None
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            # explicit dpi: the global rcParams may be set for saved figures
+            self.hist_fig = Figure(figsize=(4, 2.6), dpi=100)
+            self.hist_canvas = FigureCanvasQTAgg(self.hist_fig)
+            self.hist_canvas.setMinimumHeight(240)
+            self.hist_canvas.setMaximumHeight(320)
+            v.addWidget(self.hist_canvas)
+        except Exception as e:                      # no Qt backend for matplotlib
+            msg = QLabel(f"The histogram cannot be shown here ({e}); it can still be saved.")
+            msg.setWordWrap(True)
+            v.addWidget(msg)
+        self.hist_truncated = QCheckBox("Include truncated wires")
+        self.hist_truncated.setToolTip(
+            "Also count the wires cut by the border, an electrode or an area to ignore\n"
+            "(stacked in gray): their length is only a lower bound.")
+        self.hist_truncated.toggled.connect(lambda _: self.draw_histogram())
+        self.hist_bins = _spin(0, 500, 0)
+        self.hist_bins.setSpecialValueText("auto")
+        self.hist_bins.setPrefix("bins: ")
+        self.hist_bins.valueChanged.connect(lambda _: self.draw_histogram())
+        v.addWidget(_hbox(self.hist_truncated, self.hist_bins))
+        btn = QPushButton("Save histogram...")
+        btn.setToolTip("Lengths in \u00b5m when the scale is set (Image tab), otherwise in px.")
+        btn.clicked.connect(self.save_histogram)
+        v.addWidget(btn)
         lay.addWidget(box)
 
         box = QGroupBox("View")
@@ -1168,7 +1294,7 @@ class Pics2GraphWidget(QWidget):
         f.addRow(self.g_skeleton)
         lay.addWidget(box)
 
-        box = QGroupBox("Edit (wire tracing)")
+        self.g_edit_box = box = QGroupBox("Edit")
         f = QFormLayout(box)
         self.btn_delete = QPushButton("Delete wires by clicking")
         self.btn_delete.setCheckable(True)
@@ -1192,9 +1318,9 @@ class Pics2GraphWidget(QWidget):
         btn = QPushButton("Save graph (.graphml)...")
         btn.clicked.connect(self.save_graph)
         f.addRow(btn)
-        btn = QPushButton("Save wire measurements (.csv)...")
+        self.btn_save_meas = btn = QPushButton("Save wire measurements (.csv)...")
         btn.setToolTip("One row per wire of the graph: length, width (FWHM), truncated, degree;\n"
-                       "also in \u00b5m when the scale is set (tab 1). Wire tracing only.")
+                       "also in µm when the scale is set (Image tab).")
         btn.clicked.connect(self.save_measurements)
         f.addRow(btn)
         btn = QPushButton("Save figure (graph over image)...")
@@ -1205,7 +1331,6 @@ class Pics2GraphWidget(QWidget):
         f.addRow(btn)
         lay.addWidget(box)
         lay.addStretch()
-        self._update_method()
         return w
 
     def paint_exclusion(self):
@@ -1213,7 +1338,7 @@ class Pics2GraphWidget(QWidget):
         if layer is None:
             shape = self._shape()
             if shape is None:
-                self._say("Open an image first (tab 1).", "warning")
+                self._say("Open an image first (Image tab).", "warning")
                 return
             layer = self.viewer.add_labels(np.zeros(shape, np.uint8), name=EXCLUDE, opacity=0.4)
             layer.brush_size = 40
@@ -1226,7 +1351,7 @@ class Pics2GraphWidget(QWidget):
         layer = self._layer(EXCLUDE_SHAPES)
         if layer is None:
             if self._shape() is None:
-                self._say("Open an image first (tab 1).", "warning")
+                self._say("Open an image first (Image tab).", "warning")
                 return
             layer = self.viewer.add_shapes(
                 name=EXCLUDE_SHAPES, ndim=2, edge_width=4, edge_color="red",
@@ -1259,17 +1384,73 @@ class Pics2GraphWidget(QWidget):
             mask = drawn if mask is None else (mask | drawn)
         return mask if mask is not None and mask.any() else None
 
+    def _wire_method(self):
+        return self.g_method.currentIndex() == 0
+
     def _update_method(self, *_):
-        wires = self.g_method.currentIndex() == 0
-        self.g_wire_box.setVisible(wires)
-        self.g_skel_box.setVisible(not wires)
+        """Show only the tabs of the chosen method, numbered in the order to follow."""
+        wires = self._wire_method()
+        steps = self.STEPS[self.g_method.currentIndex()]
+        current = self.tabs.currentWidget()
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        for i, key in enumerate(steps, 1):
+            self.tabs.addTab(self._pages[key], f"{i}. {self.TAB_TITLES[key]}")
+        self.tabs.setCurrentIndex(max(self.tabs.indexOf(current), 0))
+        for key, btn in self._next_buttons.items():
+            i = steps.index(key) if key in steps else len(steps)
+            if i + 1 < len(steps):
+                btn.setText(f"Next: {i + 2}. {self.TAB_TITLES[steps[i + 1]]} \u2192")
+            btn.setVisible(i + 1 < len(steps))
+        # the extraction controls go to the tab of the chosen method
+        self._extract_slots["trace" if wires else "skeleton"].addWidget(self.extract_box)
+        self.btn_extract.setText("Trace wires" if wires else "Extract graph")
+        self.btn_open_bin.setVisible(not wires)
+        self.g_skeleton.setVisible(not wires)
+        self.g_edit_box.setVisible(wires)
+        self.g_hist_box.setVisible(wires)
+        self.btn_save_meas.setVisible(wires)
+        names = " \u2192 ".join(f"{i}. {self.TAB_TITLES[k]}" + (" (optional)" if k == "electrodes" else "")
+                                for i, k in enumerate(steps, 1))
+        self.method_help.setText(
+            ("Wires are followed on the grayscale micrograph, with no binarization; each node "
+             "of the line graph is a whole wire." if wires else
+             "The micrograph is binarized and skeletonized; each node of the line graph is a "
+             "wire segment between junctions.") + "\nSteps: " + names)
+
+    def _relayout(self, key):
+        """Fit the scrolled page of a tab to its content after a wrapped text changed."""
+        area = self._pages[key]
+        w = area.widget()
+        w.layout().invalidate()
+        w.layout().activate()
+        width = area.viewport().width()
+        h = w.heightForWidth(width) if w.hasHeightForWidth() else w.sizeHint().height()
+        w.resize(width, max(h, w.minimumSizeHint().height(), area.viewport().height()))
+
+    def _go(self, key):
+        """Bring the tab of a step to the front."""
+        if self.tabs.indexOf(self._pages[key]) >= 0:
+            self.tabs.setCurrentWidget(self._pages[key])
+
+    def _next_button(self, key):
+        """'Next' button at the bottom of the tab of a step (its text is set by _update_method)."""
+        btn = QPushButton("Next")
+
+        def go():
+            steps = self.STEPS[self.g_method.currentIndex()]
+            if key in steps and steps.index(key) + 1 < len(steps):
+                self._go(steps[steps.index(key) + 1])
+        btn.clicked.connect(go)
+        self._next_buttons[key] = btn
+        return btn
 
     def extract_graph(self):
-        if self.g_method.currentIndex() == 0:
+        if self._wire_method():
             return self.extract_wires()
         mask = self.binary_mask()
         if mask is None:
-            self._say("There is no binary image yet (tabs 1-2).", "warning")
+            self._say("There is no binary image yet (Binarize tab, or open one in the Image tab).", "warning")
             return
         binary = mask.astype(np.uint8) * 255
         masks = self.electrode_masks() if self.g_use_el.isChecked() else None
@@ -1303,7 +1484,7 @@ class Pics2GraphWidget(QWidget):
         else:
             mask = self.binary_mask()
             if mask is None:
-                self._say("Open a micrograph first (tab 1).", "warning")
+                self._say("Open a micrograph first (Image tab).", "warning")
                 return
             img = mask.astype(np.uint8) * 255
             show_warning("No micrograph open: tracing the wires on the binary image, "
@@ -1341,6 +1522,8 @@ class Pics2GraphWidget(QWidget):
     def _graph_done(self, SA):
         self.SA = SA
         self._deleted_stack = []
+        self._go("results")                 # first, so the summary is laid out at its width
+        QApplication.processEvents()
         self._update_stats()
         if self._is_wires():
             if self.g_view.currentIndex() == 0:
@@ -1350,7 +1533,8 @@ class Pics2GraphWidget(QWidget):
         if self.g_skeleton.isChecked():
             self._toggle_skeleton(True)
         self.draw_graph()
-        self._say("Graph extracted. Next: export it below.")
+        self._say("Graph extracted: check it here and export it. To change the parameters, "
+                  "go back to the previous tab and extract it again.")
 
     def _update_stats(self):
         SA = self.SA
@@ -1373,7 +1557,7 @@ class Pics2GraphWidget(QWidget):
                        + f"\nWire width (FWHM): {wq[1]:.2f} px [{wq[0]:.2f}-{wq[2]:.2f}]"
                        + (f" = {wq[1] * u:.2f} {um}" if u else "")
                        + f"\n{st['n_truncated']} wires truncated (border, electrode or ignored area)"
-                       + ("" if u else "; set the scale in tab 1 for \u00b5m") + "\n")
+                       + ("" if u else "; set the scale in the Image tab for \u00b5m") + "\n")
             txt += (f"L: {n_w} wires, {L.number_of_edges() - n_vin - n_vout} contacts "
                     f"({len(SA.wires)} wires found before cleaning)\n"
                     f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n"
@@ -1387,8 +1571,79 @@ class Pics2GraphWidget(QWidget):
         if n_vin or n_vout:
             txt += f"\nElectrode contacts: {n_vin} Vin, {n_vout} Vout"
         self.g_stats.setText(txt)
-        # a wrapped label in a form layout does not always grow by itself
-        self.g_stats.setMinimumHeight(self.g_stats.heightForWidth(max(self.g_stats.width(), 300)))
+        QTimer.singleShot(0, lambda: self._relayout("results"))
+        self.draw_histogram()
+
+    # ------------------------------------------------------ histogram of the wire lengths
+    def _has_lengths(self):
+        return self._is_wires() and bool(getattr(self.SA, "measurements", None))
+
+    def _hist_options(self):
+        return dict(include_truncated=self.hist_truncated.isChecked(),
+                    bins=self.hist_bins.value() or "auto")
+
+    def _theme_colors(self):
+        """Background and text colors of napari's theme, for the embedded histogram."""
+        try:
+            from napari.utils.theme import get_theme
+            t = get_theme(self.viewer.theme)
+            return t.background.as_hex(), t.text.as_hex()
+        except Exception:
+            return "white", "black"
+
+    def draw_histogram(self):
+        if self.hist_canvas is None:
+            return
+        fig = self.hist_fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        if self._has_lengths():
+            plot_wire_length_histogram(self.SA, ax=ax, **self._hist_options())
+        else:
+            ax.text(0.5, 0.5, "Trace the wires to see their lengths",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        bg, fg = self._theme_colors()
+        fig.patch.set_facecolor(bg)
+        ax.set_facecolor(bg)
+        ax.tick_params(colors=fg, labelsize=8)
+        ax.xaxis.label.set_fontsize(9)
+        ax.yaxis.label.set_fontsize(9)
+        for spine in ax.spines.values():
+            spine.set_color(fg)
+        for text in [ax.xaxis.label, ax.yaxis.label] + list(ax.texts):
+            text.set_color(fg)
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_color(fg)
+                text.set_fontsize(8)
+        # the canvas may have been resized while its tab was hidden
+        w, h = self.hist_canvas.width(), self.hist_canvas.height()
+        if w > 1 and h > 1:
+            fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=False)
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+        self.hist_canvas.draw()
+
+    def save_histogram(self):
+        if not self._has_lengths():
+            self._say("Trace the wires first.", "warning")
+            return
+        default = (os.path.splitext(self.raw_path)[0] + "_wire_lengths.png") if self.raw_path \
+            else "wire_lengths.png"
+        path, _ = QFileDialog.getSaveFileName(self, "Save histogram", default,
+                                              "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+        if not path:
+            return
+        from matplotlib.figure import Figure
+        fig = Figure(figsize=(6, 4))
+        plot_wire_length_histogram(self.SA, ax=fig.add_subplot(111), save_path=path, dpi=300,
+                                   **self._hist_options())
+        self._say(f"Histogram saved to {path}.")
 
     # ------------------------------------------------------ deleting wires by hand
     def _toggle_delete_mode(self, on):
