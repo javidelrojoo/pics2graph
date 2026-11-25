@@ -1219,6 +1219,30 @@ class WireAnalysis:
         self.pixel_size = pixel_size
         return self.measurements
 
+    def set_pixel_size(self, pixel_size):
+        """
+        Set (or clear, with None) the scale after measuring: updates
+        ``length_um`` / ``width_um`` of every wire and the graph attributes.
+        """
+        self.pixel_size = pixel_size or None
+        for m in getattr(self, "measurements", None) or []:
+            m.pop("length_um", None)
+            m.pop("width_um", None)
+            if self.pixel_size:
+                m["length_um"] = m["length"] * self.pixel_size
+                m["width_um"] = m["width"] * self.pixel_size
+        L = getattr(self, "L", None)
+        if L is not None:
+            for n, d in L.nodes(data=True):
+                if isinstance(n, str):
+                    continue
+                d.pop("length_um", None)
+                d.pop("width_um", None)
+                m = self.measurements[n]
+                for k in ("length_um", "width_um"):
+                    if k in m and not np.isnan(m[k]):
+                        d[k] = float(m[k])
+
     def _visible_length(self, p, i, img):
         """
         Length of the wire as seen in the image: without the bridges added by
@@ -1317,7 +1341,8 @@ class WireAnalysis:
             meas = self.measurements[i] if getattr(self, "measurements", None) else {}
             extra = {k: (float(v) if not isinstance(v, bool) else v) for k, v in meas.items()
                      if k != "length" and not (isinstance(v, float) and np.isnan(v))}
-            L.add_node(i, x=float(c[0]), y=float(c[1]), length=polyline_length(p), **extra,
+            L.add_node(i, x=float(c[0]), y=float(c[1]),
+                       length=float(meas.get("length", polyline_length(p))), **extra,
                        x0=float(p[0, 0]), y0=float(p[0, 1]),
                        x1=float(p[-1, 0]), y1=float(p[-1, 1]),
                        path=paths[i])

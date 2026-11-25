@@ -113,7 +113,14 @@ def parse_args():
                    help="Mask of areas to ignore (white = ignore), e.g. dust or substrate "
                         "outside the network.")
     w.add_argument("--pixel-size", type=float, default=None,
-                   help="Micrometers per pixel, to also give lengths and widths in um.")
+                   help="Micrometers per pixel, to also give lengths and widths in um "
+                        "(default: the calibration stored in the TIFF, if any).")
+    w.add_argument("--scale-bar", metavar="IMAGE", default=None,
+                   help="Picture with the microscope's scale bar (same camera and objective): "
+                        "the pixel size is taken from its bar; give its length with "
+                        "--scale-bar-um.")
+    w.add_argument("--scale-bar-um", type=float, default=100.0,
+                   help="Length written on the scale bar, in um (default 100).")
     w.add_argument("--measurements", metavar="CSV", default=None,
                    help="Save one row per wire of the graph: length, width, whether it is "
                         "truncated (reaches the border, an electrode or an excluded area), "
@@ -223,6 +230,19 @@ def main():
                   "is more faithful on the original micrograph (--image path/M4.tif).")
         SA = WireAnalysis(img_path, wire_width=args.wire_width, invert=args.invert)
         progress = _console_progress() if verbose else None
+        pixel_size = args.pixel_size
+        if pixel_size is None and args.scale_bar:
+            from scalebar import pixel_size_from_scale_bar
+            pixel_size, bar = pixel_size_from_scale_bar(
+                args.scale_bar, args.scale_bar_um, downsample=args.stitch_downsample)
+            if verbose:
+                print(f"Scale bar: {bar[4]:.0f} px = {args.scale_bar_um:g} um -> "
+                      f"{pixel_size:.4f} um/px.")
+        if pixel_size is None:
+            from scalebar import read_pixel_size
+            pixel_size = read_pixel_size(img_path)
+            if pixel_size and verbose:
+                print(f"Scale read from the image: {pixel_size:.4f} um/px.")
         if verbose:
             print(f"Wire width: {SA.wire_width:.1f} px.")
         SA.complete_analysis(
@@ -235,7 +255,7 @@ def main():
             join_distance=args.join_distance,
             contact_distance=args.contact_distance,
             exclude_mask=args.exclude,
-            pixel_size=args.pixel_size,
+            pixel_size=pixel_size,
             verbose=verbose,
             progress=progress,
         )

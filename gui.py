@@ -98,6 +98,8 @@ WIRES = "wires"
 DANGLING = "wires left out (dead ends)"
 EXCLUDE = "areas to ignore"
 EXCLUDE_SHAPES = "rectangles to ignore"
+SCALE_IMG = "scale-bar picture"
+SCALE_LINE = "scale bar"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
@@ -390,6 +392,41 @@ class Pics2GraphWidget(QWidget):
         b.addWidget(btn_bin)
         lay.addWidget(box)
 
+        box = QGroupBox("Scale")
+        f = QFormLayout(box)
+        self.sc_pixel = _dspin(0, 100000, 0, 0.01, 4)
+        self.sc_pixel.setSpecialValueText("not set")
+        self.sc_pixel.setSuffix(" \u00b5m/px")
+        self.sc_pixel.setToolTip(
+            "Micrometers per pixel of the micrograph. With it the lengths and widths of the\n"
+            "wires are also given in \u00b5m. Read from the TIFF when it has a calibration\n"
+            "(ImageJ / Fiji 'Set Scale'); otherwise type it or take it from a picture with\n"
+            "the microscope's scale bar.")
+        self.sc_pixel.valueChanged.connect(lambda _: self._scale_changed())
+        self.sc_bar_um = _dspin(0, 10 ** 6, 100, 10, 2)
+        self.sc_bar_um.setSuffix(" \u00b5m")
+        self.sc_bar_um.setToolTip("Length written on the scale bar.")
+        self.sc_bar_um.valueChanged.connect(lambda _: self.use_scale_line(quiet=True))
+        self.sc_downsample = _spin(1, 32, 1)
+        self.sc_downsample.setToolTip(
+            "If the micrograph is a mosaic of tiles reduced by this factor before stitching,\n"
+            "its pixels are this many times larger than those of the scale-bar picture.")
+        self.sc_downsample.valueChanged.connect(lambda _: self.use_scale_line(quiet=True))
+        btn_sc = QPushButton("Picture with scale bar...")
+        btn_sc.setToolTip(
+            "Open a picture taken with the same camera and objective that has the microscope's\n"
+            "overlay (e.g. a single frame saved with the scale bar). The bar is found by itself\n"
+            "and marked with a line; type the length written on it. If the line is wrong, draw\n"
+            "a new one along the bar and press 'Use drawn line'.")
+        btn_sc.clicked.connect(self._ask_scale_picture)
+        btn_line = QPushButton("Use drawn line")
+        btn_line.clicked.connect(lambda: self.use_scale_line())
+        f.addRow("Pixel size", self.sc_pixel)
+        f.addRow(_hbox(btn_sc, btn_line))
+        f.addRow("Bar length", self.sc_bar_um)
+        f.addRow("Mosaic downsample", self.sc_downsample)
+        lay.addWidget(box)
+
         box = QGroupBox("Stitch tiles with Fiji")
         f = QFormLayout(box)
         row, self.st_tiles = self._path_row("dir", placeholder="folder with the tiles")
@@ -520,8 +557,14 @@ class Pics2GraphWidget(QWidget):
         self.viewer.layers.move(self.viewer.layers.index(RAW), 0)   # keep it at the bottom
         self.viewer.reset_view()
         h, w = img.shape[:2]
-        self._say(f"Opened {os.path.basename(path)} ({w} x {h} px). Next: 3. Electrodes and "
-                  "4. Graph (wire tracing), or 2. Binarize for the skeleton method.")
+        msg = f"Opened {os.path.basename(path)} ({w} x {h} px). "
+        from scalebar import read_pixel_size
+        ps = read_pixel_size(path)
+        if ps:
+            self.sc_pixel.setValue(ps)
+            msg += f"Scale read from the file: {ps:.4f} \u00b5m/px. "
+        self._say(msg + "Next: 3. Electrodes and 4. Graph (wire tracing), "
+                  "or 2. Binarize for the skeleton method.")
 
     def open_binary(self, path):
         mask = imread(path, cv2.IMREAD_GRAYSCALE) > 0
@@ -529,6 +572,74 @@ class Pics2GraphWidget(QWidget):
         if self._layer(RAW) is None:
             self.viewer.reset_view()
         self._say(f"Opened binary image {os.path.basename(path)}. Next: 3. Electrodes or 4. Graph.")
+
+    # ------------------------------------------------------------------ scale
+    def pixel_size(self):
+        """Micrometers per pixel of the micrograph, or None if not set."""
+        return self.sc_pixel.value() or None
+
+    def _ask_scale_picture(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Picture with the scale bar",
+                                              os.path.dirname(self.raw_path or ""), IMAGE_FILTER)
+        if path:
+            self.open_scale_picture(path)
+
+    def open_scale_picture(self, path):
+        from scalebar import find_scale_bar
+        img = to_rgb(imread(path))
+        self._remove(SCALE_IMG, SCALE_LINE)
+        self.viewer.add_image(img, name=SCALE_IMG, rgb=img.ndim == 3)
+        bar = find_scale_bar(img)
+        layer = self.viewer.add_shapes(name=SCALE_LINE, ndim=2, edge_width=3,
+                                       edge_color="cyan", shape_type="line")
+        if bar is not None:
+            x0, y0, x1, y1, _ = bar
+            layer.add_lines([np.array([[y0, x0], [y1, x1]], float)], edge_color="cyan")
+        h, w = img.shape[:2]
+        scene = getattr(self.viewer, "scene", None)
+        cam = scene.camera if scene is not None and hasattr(scene, "camera") else self.viewer.camera
+        cam.center = (h / 2, w / 2) if bar is None else ((y0 + y1) / 2, (x0 + x1) / 2)
+        cam.zoom = 1.0 if bar is None else 4.0
+        self.viewer.layers.selection.active = layer
+        if bar is None:
+            layer.mode = "add_line"
+            self._say("No scale bar found: draw a line along the bar (click both ends), "
+                      "type its length and press 'Use drawn line'.", "warning")
+            return
+        layer.mode = "select"
+        self.use_scale_line(quiet=True)
+        self._say(f"Scale bar found ({bar[4]:.0f} px, cyan line). Type the length written on it: "
+                  f"pixel size = {self.sc_pixel.value():.4f} \u00b5m/px. You can delete the "
+                  f"'{SCALE_IMG}' and '{SCALE_LINE}' layers afterwards.")
+
+    def use_scale_line(self, quiet=False):
+        """Pixel size from the last line of the scale-bar layer."""
+        layer = self._layer(SCALE_LINE)
+        lines = [np.asarray(d) for d, t in zip(layer.data, layer.shape_type)
+                 if t in ("line", "path")] if layer is not None else []
+        if not lines:
+            if not quiet:
+                self._say("Open a picture with the scale bar first, or draw a line along the bar "
+                          f"in the '{SCALE_LINE}' layer.", "warning")
+            return
+        p = lines[-1][:, -2:]
+        length = float(np.hypot(*(p[-1] - p[0])))
+        if length <= 0 or self.sc_bar_um.value() <= 0:
+            return
+        ps = self.sc_bar_um.value() / length * self.sc_downsample.value()
+        self.sc_pixel.setValue(ps)
+        if not quiet:
+            self._say(f"Scale bar: {length:.1f} px = {self.sc_bar_um.value():g} \u00b5m"
+                      + (f", mosaic downsampled x{self.sc_downsample.value()}"
+                         if self.sc_downsample.value() > 1 else "")
+                      + f" -> {ps:.4f} \u00b5m/px.")
+
+    def _scale_changed(self):
+        SA = self.SA
+        if SA is not None and getattr(SA, "measurements", None) is not None \
+                and hasattr(SA, "set_pixel_size"):
+            SA.set_pixel_size(self.pixel_size())
+            self._update_stats()
 
     def check_stitch_size(self):
         tiles_dir = self.st_tiles.text().strip()
@@ -598,6 +709,7 @@ class Pics2GraphWidget(QWidget):
 
     def _stitch_done(self, path):
         self.open_raw(path)
+        self.sc_downsample.setValue(self.st_downsample.value())
         self._say(f"Mosaic saved to {path}. Next: 2. Binarize.")
 
     # -------------------------------------------------------------------------
@@ -1080,6 +1192,11 @@ class Pics2GraphWidget(QWidget):
         btn = QPushButton("Save graph (.graphml)...")
         btn.clicked.connect(self.save_graph)
         f.addRow(btn)
+        btn = QPushButton("Save wire measurements (.csv)...")
+        btn.setToolTip("One row per wire of the graph: length, width (FWHM), truncated, degree;\n"
+                       "also in \u00b5m when the scale is set (tab 1). Wire tracing only.")
+        btn.clicked.connect(self.save_measurements)
+        f.addRow(btn)
         btn = QPushButton("Save figure (graph over image)...")
         btn.clicked.connect(self.save_figure)
         f.addRow(btn)
@@ -1201,6 +1318,10 @@ class Pics2GraphWidget(QWidget):
         gap, invert, clean = self.g_gap.value(), self.g_invert.isChecked(), self.g_clean.isChecked()
         exclude = self.exclusion_mask()
         raw_path = self.raw_path
+        pixel_size = self.pixel_size()
+        for name in (SCALE_IMG, SCALE_LINE):       # it would hide part of the result
+            if self._layer(name) is not None:
+                self._layer(name).visible = False
 
         progress = self._progress_callback()
 
@@ -1211,7 +1332,7 @@ class Pics2GraphWidget(QWidget):
             WA.complete_analysis(electrodes_path=masks, clean_network=clean, progress=progress,
                                  seed_threshold=seed, low_threshold=low, max_gap=gap,
                                  join_distance=join, contact_distance=contact,
-                                 exclude_mask=exclude)
+                                 exclude_mask=exclude, pixel_size=pixel_size)
             return WA
 
         self._run(job, self._graph_done, self.btn_extract,
@@ -1240,16 +1361,24 @@ class Pics2GraphWidget(QWidget):
             else sum(1 for n in G if isinstance(n, str) and n.startswith("Vout_"))
         if self._is_wires():
             n_w = sum(1 for n in L if not isinstance(n, str))
-            txt = (f"Wire width {SA.wire_width:.1f} px, start contrast {SA.seed_threshold:.0f}, "
-                   f"end contrast {SA.low_threshold:.0f}\n"
-                   f"L: {n_w} wires, {L.number_of_edges() - n_vin - n_vout} contacts "
-                   f"({len(SA.wires)} wires found before cleaning)\n"
-                   f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            txt = ""
             if getattr(SA, "measurements", None):
                 st = SA.measurement_summary()
                 lq, wq = st["length_q"], st["width_q"]
-                txt += (f"\nLength (complete wires) median {lq[1]:.0f} px [{lq[0]:.0f}-{lq[2]:.0f}], "
-                        f"width {wq[1]:.2f} px; {st['n_truncated']} wires truncated")
+                u = self.pixel_size()
+                um = "\u00b5m"
+                txt = (f"Wire length (median [quartiles], complete wires): "
+                       f"{lq[1]:.0f} px [{lq[0]:.0f}-{lq[2]:.0f}]"
+                       + (f" = {lq[1] * u:.1f} {um} [{lq[0] * u:.1f}-{lq[2] * u:.1f}]" if u else "")
+                       + f"\nWire width (FWHM): {wq[1]:.2f} px [{wq[0]:.2f}-{wq[2]:.2f}]"
+                       + (f" = {wq[1] * u:.2f} {um}" if u else "")
+                       + f"\n{st['n_truncated']} wires truncated (border, electrode or ignored area)"
+                       + ("" if u else "; set the scale in tab 1 for \u00b5m") + "\n")
+            txt += (f"L: {n_w} wires, {L.number_of_edges() - n_vin - n_vout} contacts "
+                    f"({len(SA.wires)} wires found before cleaning)\n"
+                    f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges\n"
+                    f"Traced with: width {SA.wire_width:.1f} px, start contrast "
+                    f"{SA.seed_threshold:.0f}, end contrast {SA.low_threshold:.0f}")
             if SA.removed_wires:
                 txt += f"\n{len(SA.removed_wires)} wires deleted by hand"
         else:
@@ -1258,6 +1387,8 @@ class Pics2GraphWidget(QWidget):
         if n_vin or n_vout:
             txt += f"\nElectrode contacts: {n_vin} Vin, {n_vout} Vout"
         self.g_stats.setText(txt)
+        # a wrapped label in a form layout does not always grow by itself
+        self.g_stats.setMinimumHeight(self.g_stats.heightForWidth(max(self.g_stats.width(), 300)))
 
     # ------------------------------------------------------ deleting wires by hand
     def _toggle_delete_mode(self, on):
@@ -1430,8 +1561,21 @@ class Pics2GraphWidget(QWidget):
         default = (os.path.splitext(self.raw_path)[0] + ".graphml") if self.raw_path else "graph.graphml"
         path, _ = QFileDialog.getSaveFileName(self, "Save graph", default, "GraphML (*.graphml)")
         if path:
+            if self._is_wires():
+                self.SA.set_pixel_size(self.pixel_size())
             self.SA.save_graph(path, save_line_graph=line)
             self._say(f"{'Line' if line else 'Spatial'} graph saved to {path}.")
+
+    def save_measurements(self):
+        if self.SA is None or not self._is_wires():
+            self._say("Extract the graph with wire tracing first.", "warning")
+            return
+        default = (os.path.splitext(self.raw_path)[0] + "_wires.csv") if self.raw_path else "wires.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "Save wire measurements", default, "CSV (*.csv)")
+        if path:
+            self.SA.set_pixel_size(self.pixel_size())
+            self.SA.measurement_table(path)
+            self._say(f"Measurements of {self.SA.L.number_of_nodes()} wires saved to {path}.")
 
     def save_figure(self):
         if self.SA is None:

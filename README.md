@@ -26,6 +26,7 @@ tiles ──(stitching, Fiji)──► raw image
 | `preprocessing.py` | Adaptive binarization of the photomicrograph. |
 | `WireTracing.py` | Graph of whole wires traced on the grayscale micrograph (default method). |
 | `SkeletonAnalysis.py` | Morphological cleaning, skeletonization, graph extraction and pruning, line graph and export (skeleton method). |
+| `scalebar.py` | Image scale (µm/px): from a picture with the microscope's scale bar or from a calibrated TIFF. |
 | `visualization.py` | Plots the graph (or the line graph) overlaid on the image. |
 | `main.py` | Command-line entry point. |
 | `gui.py` | Graphical interface (napari) covering the whole pipeline. |
@@ -56,10 +57,10 @@ On Windows you can also **double-click `pics2graph.bat`** (no need to open a ter
 
 It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the right, one tab per stage:
 
-1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal).
+1. **Image**: open a micrograph or an already binarized image, or stitch a folder of tiles with Fiji (all the plugin parameters of `stitching.py` are available; Fiji's progress is printed in the terminal). *Scale*: the pixel size in µm/px, read from the TIFF when it has a calibration, typed, or taken from a picture with the microscope's scale bar (see *Scale* below).
 2. **Binarize** (only needed for the skeleton method): adaptive binarization with live preview while you move *block size*, *C* and the intensity threshold. The result is an editable `binary` layer: select it and use napari's brush (label 1) to add wire pixels or the eraser to remove them. *Save binary image...* exports it.
 3. **Electrodes**: paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, load existing masks, or get them **from a later photo** (see *Electrodes from a later photo*). *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
-4. **Graph**: choose the method (*Trace wires on the micrograph*, the default, or *Skeleton of the binary image*), extract the graph (optional cleaning and electrodes), view it over the image with zoom, and export the `.graphml`, a figure or a screenshot. With wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back. The exported `.graphml`, figure and measurements reflect the deletions. Its parameters (wire width, start/end contrast, gap, join and contact distances) default to *auto*.
+4. **Graph**: choose the method (*Trace wires on the micrograph*, the default, or *Skeleton of the binary image*), extract the graph (optional cleaning and electrodes), view it over the image with zoom, and export the `.graphml`, a figure or a screenshot. With wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back. The exported `.graphml`, figure and measurements reflect the deletions. The panel shows the median length and width of the wires (in µm too when the scale is set) and *Save wire measurements (.csv)* writes one row per wire. Its parameters (wire width, start/end contrast, gap, join and contact distances) default to *auto*.
 
 Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
 
@@ -100,7 +101,7 @@ Main options (`python main.py -h` lists them all):
 | `--output` | Path of the `.graphml` (defaults to next to the image). |
 | `--graph {line,spatial}` | Graph to save: line graph (nodes = wires, default) or spatial graph (nodes = junctions / contacts). |
 | `--no-clean` | Keep dangling parts: wires with fewer than two contacts (`wires`), degree-1 and degree-2 nodes (`skeleton`). |
-| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude`, `--pixel-size`, `--measurements` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
+| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude`, `--pixel-size`, `--scale-bar`, `--scale-bar-um`, `--measurements` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
 | `--opening-radius`, `--closing-radius`, `--min-object-size` | Cleaning before skeletonizing (see *Binarization and cleaning parameters*). |
 | `--stitch TILES_DIR` | Stitch the tiles in that folder with Fiji first (with `--method skeleton` it implies `--binarize`). |
 | `--fiji`, `--stitch-mode {unknown,positions}`, `--fiji-memory` | Fiji location, stitching mode and Java memory. |
@@ -122,7 +123,7 @@ Main options (`python main.py -h` lists them all):
 5. **Contacts.** Two wires touch when their center lines come within `contact_distance` (crossings, side contacts) or an end of one is within `end_tolerance` of the other (a wire ending on another). Wires touching an electrode mask get `Vin_i` / `Vout_i` neighbors, named as before, so the downstream code that looks for `"Vin"` / `"Vout"` in the node names keeps working.
 6. **Cleaning.** Wires with fewer than two contacts are removed repeatedly (they cannot carry current), the equivalent of pruning degree-1 nodes in the skeleton method. They are still drawn, in gray, in the *Wires* view and in `plot_wires_on_image`, so a wire left out of the graph can be told apart from one that was not detected.
 
-Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoints (`x0`, `y0`, `x1`, `y1`) and the whole center line as `path` (`"x,y;x,y;..."`, every 3 px); each edge stores the contact position (`x`, `y`). `G` (`--graph spatial`) has the contacts as nodes and the pieces of wire between consecutive contacts as edges.
+Each node of `L` stores the wire's centroid (`x`, `y`), `length` and `width` in px (and `length_um`, `width_um` when the scale is known, see *Scale* below), whether it is `truncated`, endpoints (`x0`, `y0`, `x1`, `y1`) and the whole center line as `path` (`"x,y;x,y;..."`, every 3 px); each edge stores the contact position (`x`, `y`). `G` (`--graph spatial`) has the contacts as nodes and the pieces of wire between consecutive contacts as edges.
 
 **Parameters.** All have automatic defaults; these are the ones worth adjusting while looking at the *Wires* view:
 
@@ -139,10 +140,11 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoint
 
 Wires must be brighter than the background (optical dark field, SEM), otherwise use `invert`. It also accepts a binary image (it is blurred first), but it is more faithful on the original micrograph, where crossing wires can still be told apart. The orientation scores are computed by tiles and cached, so memory stays at a few bytes per pixel even for very large mosaics; the M4 sample (2767 × 2424 px) takes about 20 s.
 
-**Measurements.** Each wire node of `L` also has `width` and `truncated` (and `length_um`, `width_um` with `--pixel-size`). `--measurements wires.csv` saves one row per wire (id, degree, length, width, truncated) and the command line prints the medians.
+**Measurements.** Each wire node of `L` also has `width` and `truncated` (and `length_um`, `width_um` when the scale is known). `--measurements wires.csv` saves one row per wire (id, degree, length, width, truncated) and the command line prints the medians.
 
 * `length` (px) is measured along the center line, without the bridges added at the ends and cutting each tip where the brightness falls below half of the wire's contrast. On the synthetic images it is within 2–3 % of the true length (median) for wires recovered whole. A wire split in pieces by the tracer gives two shorter lengths, so in very dense areas the distribution is biased towards short wires.
 * `truncated` marks wires with an end at the image border, an electrode, an excluded area or an empty mosaic margin: they may continue beyond what is seen, so their length is a lower bound. The printed length statistics leave them out.
+* **Scale.** The tiles of a mosaic are saved without the microscope's overlay, so the scale comes from another picture taken with the same camera and objective that has it (e.g. a single frame with the scale bar). `scalebar.py` finds the bar by itself (the longest thin straight run of one flat saturated color, or of pure white) and gives µm/px = bar length / bar px; the length written on the bar has to be typed. In the GUI: tab 1, *Picture with scale bar...* (the bar found is marked with a cyan line; if it is wrong, draw a line along the bar and press *Use drawn line*). On the command line: `--scale-bar picture.jpg --scale-bar-um 100`, or `--pixel-size` directly. A TIFF calibrated in ImageJ / Fiji (*Set Scale*) is read by itself. If the tiles were reduced before stitching (*Downsample tiles*), the mosaic's pixels are that many times larger: set *Mosaic downsample* (the GUI does it after stitching). The bar is located to ±1 px, i.e. ±0.7 % for a 150 px bar.
 * `width` (px) is the full width at half maximum of the intensity profile across the wire (median along it), measured only where no other wire is closer than 2 widths, so dense networks give it for a fraction of the wires. **In optical images of nanowires thinner than the resolution it is the width of the blurred image, not the diameter**: it tells the resolution and the focus, not the wire. It is meaningful as a diameter in SEM images where wires are many pixels wide.
 
 **How faithful is it?** `benchmarks/` generates synthetic dark-field micrographs of curved wires with known positions (`synthetic.py`) and scores each method against them (`evaluate.py`). *Whole wires* is the fraction of the true wires that are recovered as a single node covering at least 80 % of their length; *nodes / wire* is the mean number of nodes on each recovered wire (1 is ideal); *spurious* are nodes that do not lie on a single wire (for wire tracing, mostly two wires chained together where one ends next to the other).
@@ -366,13 +368,19 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`join(max_distance=None, max_angle_deg=20)`**: joins pieces of the same wire; result in `wires`.
 * **`extend_ends(max_extension=None, min_contrast=0.5, max_trim=None, gap=1.5)`**: trims the ends that overshoot the visible tip of the wire and closes the small gap between a wire's end and the wire it runs into (`n_trimmed`, `n_extended`).
 * **`find_contacts(contact_distance=None, end_tolerance=None)`**: `contacts` (i, j, x, y) and `electrode_contacts`.
-* **`measure_wires(step=2.0, pixel_size=None)`**: `measurements`, one dict per wire with `length`, `width`, `truncated`; `measurement_table(path)` writes them as CSV and `measurement_summary()` gives medians and quartiles.
+* **`measure_wires(step=2.0, pixel_size=None)`**: `measurements`, one dict per wire with `length`, `width`, `truncated`; `measurement_table(path)` writes them as CSV and `measurement_summary()` gives medians and quartiles. `set_pixel_size(um_per_px)` sets or changes the scale afterwards.
 * **`build_graphs(drop_dangling=True)`**: builds `L` (and `L_full` before cleaning) and `G`.
 * **`save_graph(path, save_line_graph=True)`**: exports `L` or `G` to `.graphml` (with `x`/`y` on every node).
 * **`complete_analysis(electrodes_path=None, clean_network=True, save_graph_path=None, ...)`**: runs everything.
 * **`remove_wires(ids)`** / **`restore_wires(ids=None)`**: delete wires by hand (false detections) and rebuild the graph; `wire_at(x, y)` gives the wire under a point. Deleted wires are kept in `removed_wires`.
 * **`wire_label_image(thickness=None, wires=None)`**: image with each wire drawn as its index + 1.
 * **`estimate_wire_width(img)`**: typical wire width in px (FWHM of the profile across the strongest ridges; distance transform for binary images).
+
+### `scalebar.py`
+
+* **`find_scale_bar(img)`**: the scale bar of a microscope overlay, `(x0, y0, x1, y1, length_px)`, or None.
+* **`pixel_size_from_scale_bar(img_or_path, bar_um, downsample=1)`**: `(um_per_px, bar)`.
+* **`read_pixel_size(path)`**: µm/px stored in a TIFF (ImageJ calibration or resolution in cm), or None.
 
 ### `visualization.py`
 
