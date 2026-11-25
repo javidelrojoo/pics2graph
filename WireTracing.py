@@ -877,61 +877,174 @@ class WireAnalysis:
         self.wires = [p for p in wires if polyline_length(p) >= self.min_length]
         return self.wires
 
-    def extend_ends(self, max_extension=None, min_response=None):
+    def _contrast_sampler(self, pts, margin):
         """
-        Close the small gaps between a wire's end and the wire it runs into.
+        Around the points ``pts``: a function ``f(q) -> (gray, background)``
+        that samples (bilinear) the image and its local background (grayscale
+        opening a bit wider than a wire) at float positions. Unlike the ridge
+        response, the image does not leak along a wire past its tip.
+        """
+        H, W = self.img.shape
+        r = int(round(1.5 * self.wire_width)) + 1
+        m = int(np.ceil(margin)) + r + 2
+        x0, y0 = max(int(pts[:, 0].min()) - m, 0), max(int(pts[:, 1].min()) - m, 0)
+        x1, y1 = min(int(pts[:, 0].max()) + m + 1, W), min(int(pts[:, 1].max()) + m + 1, H)
+        sub = self.img[y0:y1, x0:x1].astype(np.float32)
+        bg = cv2.morphologyEx(sub, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        h, w_ = sub.shape
 
-        The tracer tends to stop a few px short of a junction, where the other
-        wire distorts the ridge profile. From every end, walk straight ahead
-        (along the end's direction) for at most ``max_extension`` px
-        (default 3 x width) while the image still shows something bright
-        (best ridge response >= ``min_response``, default half the end
-        threshold). If another wire is reached, the end is extended up to it,
-        so that the contact is found. Returns the number of ends extended.
+        def bil(a, x, y, xi, yi, fx, fy):
+            return ((a[yi, xi] * (1 - fx) + a[yi, xi + 1] * fx) * (1 - fy)
+                    + (a[yi + 1, xi] * (1 - fx) + a[yi + 1, xi + 1] * fx) * fy)
+
+        def sample(q):
+            q = np.atleast_2d(q)
+            x = np.clip(q[:, 0] - x0, 0, max(w_ - 1.001, 0))
+            y = np.clip(q[:, 1] - y0, 0, max(h - 1.001, 0))
+            xi, yi = x.astype(int), y.astype(int)
+            xi, yi = np.minimum(xi, w_ - 2), np.minimum(yi, h - 2)
+            fx, fy = x - xi, y - yi
+            return bil(sub, x, y, xi, yi, fx, fy), bil(bg, x, y, xi, yi, fx, fy)
+        return sample
+
+    def extend_ends(self, max_extension=None, min_contrast=0.5, max_trim=None, gap=1.5):
+        """
+        Fix the wire ends with the image itself, not the ridge response (the
+        elongated filters keep responding a few px past a real tip and across
+        short dark gaps, so the traces tend to overshoot).
+
+        1. **Trim.** Near each end (within ``max_trim`` px, default
+           max(6, 3 x width)), the wire is cut where the image goes dark: a run
+           of at least ``gap`` px whose contrast is below ``min_contrast`` x
+           the wire's own (median) contrast. Ends near an electrode, an
+           excluded area or a mosaic margin are not trimmed.
+        2. **Extend.** The tracer also stops a few px short of a junction,
+           where the other wire distorts the ridge profile. From every end
+           that does not touch another wire, walk straight ahead for at most
+           ``max_extension`` px (default 3 x width) while the image stays
+           bright (same contrast criterion, gaps shorter than ``gap`` px
+           allowed). If another wire is reached, the end is extended up to it.
+
+        Returns the number of ends extended (``self.n_trimmed`` keeps the
+        number of ends trimmed).
         """
         w = self.wire_width
         max_ext = max_extension if max_extension is not None else 3 * w
-        thr = min_response if min_response is not None else 0.5 * self.low_threshold
+        max_trim = max_trim if max_trim is not None else max(6.0, 3 * w)
         reach = getattr(self, "contact_distance", None) or 0.8 * w
-        if len(self.wires) < 2:
+        ds = 0.5
+        n_gap = max(1, int(round(gap / ds)))
+        self._extended_ends = [(False, False)] * len(self.wires)
+        self.n_extended = self.n_trimmed = 0
+        if not self.wires:
             return 0
-        samples = [resample_polyline(p, 1.0) for p in self.wires]
+        H, W = self.img.shape
+        inside = getattr(self, "_inside", None)
+        if inside is not None and inside.any():
+            rr = int(round(5 + w + max_trim))
+            protect = cv2.dilate(inside.astype(np.uint8),
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 1,) * 2)) > 0
+        else:
+            protect = None
+
+        def protected(q):
+            if protect is None:
+                return False
+            return bool(protect[min(max(int(round(q[1])), 0), H - 1),
+                                min(max(int(round(q[0])), 0), W - 1)])
+
+        # 1. trim
+        n_w = len(self.wires)
+        wires, refs = [], []
+        for i, p in enumerate(self.wires):
+            if i % 500 == 0:
+                self._report("Closing gaps at wire ends", 0.5 * i / n_w,
+                             f"trimming, wire {i} of {n_w}")
+            p = np.asarray(p, float)
+            s = resample_polyline(p, ds)
+            smp = self._contrast_sampler(s, max_ext)
+            g, bg = smp(s)
+            ref = float(np.median(g - bg))
+            m = min(int(max_trim / ds), len(s) // 3)
+            # background level near each end (a bright blob the wire runs
+            # into is not background: the raw gray level is compared to it)
+            bends = (float(np.median(bg[:m + 1])), float(np.median(bg[len(s) - 1 - m:])))
+            refs.append((ref, bends))
+            if not ref > 0 or len(s) < 4 * n_gap:
+                wires.append(p)
+                continue
+            a, b = 0, len(s) - 1
+            for e in (0, 1):
+                if protected(s[0] if e == 0 else s[-1]):
+                    continue
+                # samples from the inside of the wire towards the tip
+                idx = np.arange(m, -1, -1) if e == 0 else np.arange(len(s) - 1 - m, len(s))
+                d = (g[idx] - bends[e]) < min_contrast * ref
+                run = 0
+                for k, v in enumerate(d):
+                    run = run + 1 if v else 0
+                    if run >= n_gap:
+                        cut = idx[k - run + 1]      # first dark sample of the run
+                        if e == 0:
+                            a = cut + 1
+                        else:
+                            b = cut - 1
+                        break
+            if a > 0 or b < len(s) - 1:
+                self.n_trimmed += (a > 0) + (b < len(s) - 1)
+                wires.append(s[a:b + 1])
+            else:
+                wires.append(p)
+        self.wires = wires
+        if len(wires) < 2:
+            return 0
+
+        # 2. extend
+        samples = [resample_polyline(p, 1.0) for p in wires]
         P = np.vstack(samples)
         O = np.concatenate([np.full(len(s), i) for i, s in enumerate(samples)])
         tree = cKDTree(P)
-        H, W = self.img.shape
-        Rmax = self.R_max
-        steps = np.arange(0.5, max_ext + 1e-9, 0.5)
-        extended = 0
-        new_wires = []
-        self._extended_ends = []
-        for i, p in enumerate(self.wires):
-            p = np.asarray(p, float)
+        steps = np.arange(ds, max_ext + 1e-9, ds)
+        new_wires, flags = [], []
+        for i, p in enumerate(wires):
+            if i % 500 == 0:
+                self._report("Closing gaps at wire ends", 0.5 + 0.5 * i / n_w,
+                             f"extending, wire {i} of {n_w}")
             ext = [False, False]
-            for e in (0, 1):
-                end = p[0] if e == 0 else p[-1]
-                t = _end_tangent(p, e)
-                # already touching another wire: nothing to do
-                if any(O[j] != i for j in tree.query_ball_point(end, reach)):
-                    continue
-                hit = None
-                for s_ in steps:
-                    q = end + t * s_
-                    xi, yi = int(round(q[0])), int(round(q[1]))
-                    if not (0 <= xi < W and 0 <= yi < H) or float(Rmax[yi, xi]) < thr:
-                        break
-                    if any(O[j] != i for j in tree.query_ball_point(q, reach)):
-                        hit = q
-                        break
-                if hit is not None:
-                    p = np.vstack([hit, p]) if e == 0 else np.vstack([p, hit])
-                    extended += 1
-                    ext[e] = True
+            smp = None
+            ref, bends = refs[i]
+            if ref > 0:
+                for e in (0, 1):
+                    thr = bends[e] + min_contrast * ref
+                    end = p[0] if e == 0 else p[-1]
+                    if any(O[j] != i for j in tree.query_ball_point(end, reach)):
+                        continue        # already touching another wire
+                    t = _end_tangent(p, e)
+                    Q = end + steps[:, None] * t
+                    ok = (Q[:, 0] >= 0) & (Q[:, 0] <= W - 1) & (Q[:, 1] >= 0) & (Q[:, 1] <= H - 1)
+                    if smp is None:
+                        smp = self._contrast_sampler(p, max_ext)
+                    c = smp(Q)[0]
+                    hit, run = None, 0
+                    for q, v, o in zip(Q, c, ok):
+                        if not o:
+                            break
+                        run = run + 1 if v < thr else 0
+                        if run >= n_gap:
+                            break
+                        if any(O[j] != i for j in tree.query_ball_point(q, reach)):
+                            hit = q
+                            break
+                    if hit is not None:
+                        p = np.vstack([hit, p]) if e == 0 else np.vstack([p, hit])
+                        ext[e] = True
+                        self.n_extended += 1
             new_wires.append(p)
-            self._extended_ends.append(tuple(ext))
+            flags.append(tuple(ext))
         self.wires = new_wires
-        self.n_extended = extended
-        return extended
+        self._extended_ends = flags
+        return self.n_extended
 
     # -------------------------------------------------------------- 4. contacts
     def find_contacts(self, contact_distance=None, end_tolerance=None):
@@ -1388,7 +1501,8 @@ class WireAnalysis:
         if extend_ends:
             self._report("Closing gaps at wire ends", 0, f"{len(self.wires)} wires", force=True)
             n = self.extend_ends()
-            log(f"Extended {n} wire ends up to the wire they run into.")
+            log(f"Trimmed {self.n_trimmed} wire ends that overshot their tip; "
+                f"extended {n} up to the wire they run into.")
         self._report("Finding contacts", 0, f"{len(self.wires)} wires", force=True)
         self.find_contacts(contact_distance=contact_distance, end_tolerance=end_tolerance)
         log(f"{len(self.contacts)} wire-wire contacts, "

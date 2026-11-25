@@ -116,7 +116,9 @@ Main options (`python main.py -h` lists them all):
 2. **Tracing.** Starting from the strongest ridge points, each wire is followed in both directions in steps of 1.5 px, re-centered on its ridge, looking only at orientations close to its current heading and with a limited curvature. At a crossing the other wire is in a different orientation, so the tracer goes straight through. Short dim stretches are bridged (`max_gap`), sharper bends are tried when the ridge is lost straight ahead, and a wire already traced in the same direction is not traced again.
    Bright structure that is not a wire is ignored. Round spots (dust, particles, blurred dots) respond as much across as along any direction, so they cannot start a wire. Rows of spots can look like a line, but they are not *continuous*: a grayscale opening of the image with straight segments of 5 × width, in every orientation, keeps the contrast of wires and erases spots and rows of spots with darker gaps; seeds and traces must keep at least 60 % of their contrast after it. Last, the empty margins of a stitched mosaic (regions that are exactly 0 and touch the border), whose straight edges would otherwise be traced as wires.
 3. **Joining.** Pieces of the same wire that could not be followed in one go (shallow crossings, bright clumps, dim spots) are joined when their ends are close and their directions continue smoothly.
-4. **Ends.** The tracer tends to stop a few px short of a junction, where the other wire distorts the ridge. Each end that does not touch anything is extended straight ahead, up to 3 × width, as long as the image stays bright; if it reaches another wire, the gap is closed.
+4. **Ends**, checked against the image itself (gray level above the local background), not against the ridge response: the elongated filters keep responding a few px past a real tip and across short dark gaps, so the traces tend to overshoot.
+   * *Trim*: near each end (up to max(6 px, 3 × width)), the wire is cut where the image goes dark — a run of ≥ 1.5 px below half of the wire's own contrast. Ends near an electrode, an excluded area or a mosaic margin are left alone.
+   * *Extend*: the tracer also stops a few px short of a junction, where the other wire distorts the ridge. Each end that does not touch anything is extended straight ahead, up to 3 × width, only while the image stays at least half as bright as the wire (gaps < 1.5 px allowed); if it reaches another wire, the gap is closed.
 5. **Contacts.** Two wires touch when their center lines come within `contact_distance` (crossings, side contacts) or an end of one is within `end_tolerance` of the other (a wire ending on another). Wires touching an electrode mask get `Vin_i` / `Vout_i` neighbors, named as before, so the downstream code that looks for `"Vin"` / `"Vout"` in the node names keeps working.
 6. **Cleaning.** Wires with fewer than two contacts are removed repeatedly (they cannot carry current), the equivalent of pruning degree-1 nodes in the skeleton method. They are still drawn, in gray, in the *Wires* view and in `plot_wires_on_image`, so a wire left out of the graph can be told apart from one that was not detected.
 
@@ -148,9 +150,9 @@ Wires must be brighter than the background (optical dark field, SEM), otherwise 
 | 1024 × 1024 px, wires 3.2 px wide | Whole wires | Nodes / wire | Spurious nodes | Contacts precision / recall |
 | --- | --- | --- | --- | --- |
 | 150 wires, skeleton | 0–1 % | 1.8–1.9 | 9–15 % | 97–98 % / 28–49 %\* |
-| 150 wires, wire tracing | 82–84 % | 1.02–1.08 | 3–8 % | 83–87 % / 68–82 % |
+| 150 wires, wire tracing | 82–84 % | 1.03–1.08 | 3–8 % | 88–95 % / 69–82 % |
 | 350 wires, skeleton | 0–1 % | 2.3–2.5 | 6–7 % | 96–97 % / 65–68 %\* |
-| 350 wires, wire tracing | 69–70 % | 1.08–1.11 | 9–12 % | 87 % / 61–69 % |
+| 350 wires, wire tracing | 69–71 % | 1.08–1.11 | 8–11 % | 91 % / 63–69 % |
 
 \* For the skeleton method the contacts are counted after grouping its segments into wires *using the ground truth*, which the method itself cannot do; they are an upper bound. Its low recall in the sparse images comes from the cleaning, which prunes wires touching a single other wire.
 
@@ -362,7 +364,7 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`orientation_scores(n_orientations=16, sigma_across=None, sigma_along=None, tile_size=256, max_cache_mb=1024)`**: sets up the ridge responses per orientation (computed by tiles on demand) and the best response per pixel (`R_max`, `R_arg`).
 * **`trace(seed_threshold=None, low_threshold=None, step=1.5, max_turn_deg=4, max_gap=2, ...)`**: follows every wire; `raw_wires` holds the traced pieces.
 * **`join(max_distance=None, max_angle_deg=20)`**: joins pieces of the same wire; result in `wires`.
-* **`extend_ends(max_extension=None, min_response=None)`**: closes the small gap between a wire's end and the wire it runs into.
+* **`extend_ends(max_extension=None, min_contrast=0.5, max_trim=None, gap=1.5)`**: trims the ends that overshoot the visible tip of the wire and closes the small gap between a wire's end and the wire it runs into (`n_trimmed`, `n_extended`).
 * **`find_contacts(contact_distance=None, end_tolerance=None)`**: `contacts` (i, j, x, y) and `electrode_contacts`.
 * **`measure_wires(step=2.0, pixel_size=None)`**: `measurements`, one dict per wire with `length`, `width`, `truncated`; `measurement_table(path)` writes them as CSV and `measurement_summary()` gives medians and quartiles.
 * **`build_graphs(drop_dangling=True)`**: builds `L` (and `L_full` before cleaning) and `G`.
