@@ -112,6 +112,12 @@ def parse_args():
     w.add_argument("--exclude", metavar="MASK", default=None,
                    help="Mask of areas to ignore (white = ignore), e.g. dust or substrate "
                         "outside the network.")
+    w.add_argument("--pixel-size", type=float, default=None,
+                   help="Micrometers per pixel, to also give lengths and widths in um.")
+    w.add_argument("--measurements", metavar="CSV", default=None,
+                   help="Save one row per wire of the graph: length, width, whether it is "
+                        "truncated (reaches the border, an electrode or an excluded area), "
+                        "degree.")
     w.add_argument("--orientations", type=int, default=16,
                    help="Number of orientation layers (default 16).")
 
@@ -207,6 +213,7 @@ def main():
             join_distance=args.join_distance,
             contact_distance=args.contact_distance,
             exclude_mask=args.exclude,
+            pixel_size=args.pixel_size,
             verbose=verbose,
         )
     else:
@@ -224,6 +231,23 @@ def main():
             closing_radius=args.closing_radius,
         )
     SA.save_graph(output, save_line_graph=(args.graph == "line"))
+    if args.method == "wires":
+        if args.measurements:
+            SA.measurement_table(args.measurements)
+        if verbose:
+            st = SA.measurement_summary()
+            u = SA.pixel_size
+            unit = lambda q: (f"{q[1]:.0f} px [{q[0]:.0f}-{q[2]:.0f}]" +  # noqa: E731
+                              (f" = {q[1] * u:.1f} um" if u else ""))
+            print(f"Wires in the graph: {st['n']} ({st['n_truncated']} truncated at the border, "
+                  f"an electrode or an excluded area).")
+            print(f"Length, complete wires, median [quartiles]: {unit(st['length_q'])}.")
+            wq = st["width_q"]
+            print(f"Width (FWHM of the profile), median [quartiles]: {wq[1]:.2f} px "
+                  f"[{wq[0]:.2f}-{wq[2]:.2f}]" + (f" = {wq[1] * u:.2f} um" if u else "") +
+                  f", measured on {st['n_width']} wires.")
+            if args.measurements:
+                print(f"Measurements per wire saved to {args.measurements}.")
     if verbose:
         G, L = SA.G, SA.L
         print(f"Spatial graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")

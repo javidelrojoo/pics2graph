@@ -858,8 +858,10 @@ class WireAnalysis:
         steps = np.arange(0.5, max_ext + 1e-9, 0.5)
         extended = 0
         new_wires = []
+        self._extended_ends = []
         for i, p in enumerate(self.wires):
             p = np.asarray(p, float)
+            ext = [False, False]
             for e in (0, 1):
                 end = p[0] if e == 0 else p[-1]
                 t = _end_tangent(p, e)
@@ -878,7 +880,9 @@ class WireAnalysis:
                 if hit is not None:
                     p = np.vstack([hit, p]) if e == 0 else np.vstack([p, hit])
                     extended += 1
+                    ext[e] = True
             new_wires.append(p)
+            self._extended_ends.append(tuple(ext))
         self.wires = new_wires
         self.n_extended = extended
         return extended
@@ -942,6 +946,180 @@ class WireAnalysis:
                         self.electrode_contacts.append((name, i, float(x), float(y)))
         return self.contacts
 
+    # ------------------------------------------------------------ measurements
+    def measure_wires(self, step=2.0, pixel_size=None):
+        """
+        Length, width and truncation of every wire, in ``self.measurements``
+        (one dict per wire, same order as ``self.wires``).
+
+        * ``length``: along the center line, in px (and ``length_um`` with
+          ``pixel_size`` in micrometers per px).
+        * ``width``: full width at half maximum of the intensity profile
+          across the wire, in px (median along the wire, leaving out the
+          places where another wire is closer than 2 widths: crossings would
+          inflate it). NaN when it cannot be measured. In optical images of
+          nanowires thinner than the resolution this is the width of the
+          blurred image of the wire, not its diameter.
+        * ``truncated``: an end lies at the image border, on an electrode, an
+          excluded area or an empty mosaic margin, so the wire may continue
+          beyond what is seen and ``length`` is only a lower bound. A wire
+          split in pieces by the tracer is not flagged.
+        """
+        from scipy.ndimage import map_coordinates
+        w = self.wire_width
+        H, W = self.img.shape
+        img = self.img.astype(np.float32)
+        # areas where a wire cannot be followed
+        blocked = np.zeros((H, W), bool)
+        for m in (getattr(self, "electrode_mask1", None), getattr(self, "electrode_mask2", None),
+                  self.exclude_mask, getattr(self, "margin_mask", None)):
+            if m is not None:
+                blocked |= m
+        r = int(round(2 * w)) + 1
+        if blocked.any():
+            blocked = cv2.dilate(blocked.astype(np.uint8),
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)) > 0
+        border = 2 * w
+        # samples along every wire
+        samples = [resample_polyline(p, step) for p in self.wires]
+        owner = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(samples)]) \
+            if samples else np.zeros(0, int)
+        P = np.vstack(samples) if samples else np.zeros((0, 2))
+        T = np.vstack([np.gradient(s_, axis=0) if len(s_) > 1 else np.array([[1.0, 0.0]])
+                       for s_ in samples]) if samples else np.zeros((0, 2))
+        T /= np.maximum(np.hypot(T[:, 0], T[:, 1]), 1e-9)[:, None]
+        widths = np.full(len(P), np.nan)
+        if len(P):
+            # skip samples with another wire nearby
+            dense = [resample_polyline(p, 1.0) for p in self.wires]
+            D = np.vstack(dense)
+            DO = np.concatenate([np.full(len(d), i) for i, d in enumerate(dense)])
+            tree = cKDTree(D)
+            _, idx = tree.query(P, k=12, distance_upper_bound=2 * w)
+            valid = idx < len(D)
+            others = valid & (DO[np.minimum(idx, len(D) - 1)] != owner[:, None])
+            alone = ~others.any(axis=1)
+            # profiles across the wire
+            half = int(np.ceil(3 * w + 3))
+            t = np.arange(-half, half + 1e-9, 0.25)
+            N = np.c_[-T[:, 1], T[:, 0]]
+            X = P[:, 0:1] + t[None] * N[:, 0:1]
+            Y = P[:, 1:2] + t[None] * N[:, 1:2]
+            prof = map_coordinates(img, [Y.ravel(), X.ravel()], order=1,
+                                   mode="nearest").reshape(X.shape)
+            c0 = len(t) // 2
+            k = max(1, int(round(0.5 / 0.25)))          # peak within +-0.5 px
+            win = prof[:, c0 - k:c0 + k + 1]
+            ip = c0 - k + win.argmax(1)
+            peak = prof[np.arange(len(prof)), ip]
+            nb = max(4, len(t) // 8)
+            bl = np.sort(prof[:, :nb * 2], axis=1)[:, :nb].mean(1)
+            br = np.sort(prof[:, -nb * 2:], axis=1)[:, :nb].mean(1)
+            hl, hr = (peak + bl) / 2, (peak + br) / 2
+            cols = np.arange(len(t))[None]
+            below_l = (prof < hl[:, None]) & (cols < ip[:, None])
+            below_r = (prof < hr[:, None]) & (cols > ip[:, None])
+            okl, okr = below_l.any(1), below_r.any(1)
+            jl = np.where(okl, len(t) - 1 - below_l[:, ::-1].argmax(1), 0)
+            jr = np.where(okr, below_r.argmax(1), 0)
+            rows = np.arange(len(prof))
+            pl0, pl1 = prof[rows, jl], prof[rows, np.minimum(jl + 1, len(t) - 1)]
+            pr0, pr1 = prof[rows, np.maximum(jr - 1, 0)], prof[rows, jr]
+            xl = t[jl] + (hl - pl0) / np.where(pl1 != pl0, pl1 - pl0, 1) * 0.25
+            xr = t[np.maximum(jr - 1, 0)] + (pr0 - hr) / np.where(pr0 != pr1, pr0 - pr1, 1) * 0.25
+            contrast = peak - np.maximum(bl, br)
+            good = alone & okl & okr & (contrast >= max(5.0, self.low_threshold if hasattr(self, "low_threshold") else 5.0))
+            widths[good] = (xr - xl)[good]
+        self.measurements = []
+        for i, p in enumerate(self.wires):
+            p = np.asarray(p)
+            wv = widths[owner == i]
+            wv = wv[np.isfinite(wv)]
+            trunc = False
+            for e in (p[0], p[-1]):
+                x, y = e
+                if x < border or y < border or x > W - 1 - border or y > H - 1 - border:
+                    trunc = True
+                elif blocked[min(int(round(y)), H - 1), min(int(round(x)), W - 1)]:
+                    trunc = True
+            length = self._visible_length(p, i, img)
+            m = dict(length=length, width=float(np.median(wv)) if len(wv) >= 3 else float("nan"),
+                     truncated=trunc)
+            if pixel_size:
+                m["length_um"] = length * pixel_size
+                m["width_um"] = m["width"] * pixel_size
+            self.measurements.append(m)
+        self.pixel_size = pixel_size
+        return self.measurements
+
+    def _visible_length(self, p, i, img):
+        """
+        Length of the wire as seen in the image: without the bridges added by
+        ``extend_ends`` and with each end cut where the brightness along the
+        wire falls below half of its contrast (the ridge filter keeps
+        responding a few px past the real tip).
+        """
+        ext = self._extended_ends[i] if getattr(self, "_extended_ends", None) and \
+            i < len(self._extended_ends) else (False, False)
+        p = np.asarray(p, float)
+        if ext[0] and len(p) > 2:
+            p = p[1:]
+        if ext[1] and len(p) > 2:
+            p = p[:-1]
+        s = resample_polyline(p, 0.5)
+        if len(s) < 5:
+            return polyline_length(p)
+        H, W = img.shape
+        xi = np.clip(np.round(s[:, 0]).astype(int), 0, W - 1)
+        yi = np.clip(np.round(s[:, 1]).astype(int), 0, H - 1)
+        r = int(round(1.5 * self.wire_width)) + 1
+        y0, y1 = max(yi.min() - r, 0), min(yi.max() + r + 1, H)
+        x0, x1 = max(xi.min() - r, 0), min(xi.max() + r + 1, W)
+        sub = self.img[y0:y1, x0:x1]
+        bg = cv2.morphologyEx(sub, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        c = img[yi, xi] - bg[yi - y0, xi - x0].astype(np.float32)
+        half = 0.5 * np.median(c)
+        if not half > 0:
+            return polyline_length(p)
+        on = np.flatnonzero(c >= half)
+        if len(on) < 2:
+            return polyline_length(p)
+        a, b = on[0], on[-1]
+        # unless the end was bridged on purpose, cut where the tip fades
+        a = 0 if ext[0] else a
+        b = len(s) - 1 if ext[1] else b
+        return polyline_length(s[a:b + 1])
+
+    def measurement_table(self, path, only_graph=True):
+        """Write the measurements as CSV (one row per wire; node id = ``wire``)."""
+        import csv
+        ids = [n for n in self.L.nodes if not isinstance(n, str)] if only_graph \
+            else range(len(self.wires))
+        keys = ["length", "width", "truncated"]
+        if getattr(self, "pixel_size", None):
+            keys += ["length_um", "width_um"]
+        with open(path, "w", newline="") as f:
+            wr = csv.writer(f)
+            wr.writerow(["wire", "degree"] + keys)
+            for i in ids:
+                m = self.measurements[i]
+                deg = self.L.degree(i) if i in self.L else 0
+                wr.writerow([i, deg] + [m[k] for k in keys])
+
+    def measurement_summary(self, only_graph=True):
+        """Medians and quartiles of length and width (complete wires for length)."""
+        ids = [n for n in self.L.nodes if not isinstance(n, str)] if only_graph \
+            else range(len(self.wires))
+        M = [self.measurements[i] for i in ids]
+        L_all = np.array([m["length"] for m in M])
+        L_ok = np.array([m["length"] for m in M if not m["truncated"]])
+        Wd = np.array([m["width"] for m in M])
+        Wd = Wd[np.isfinite(Wd)]
+        q = lambda a: tuple(np.percentile(a, [25, 50, 75])) if len(a) else (np.nan,) * 3  # noqa: E731
+        return dict(n=len(M), n_truncated=int(len(L_all) - len(L_ok)),
+                    length_q=q(L_ok), length_all_q=q(L_all), width_q=q(Wd), n_width=len(Wd))
+
     # ---------------------------------------------------------------- 5. graphs
     def build_graphs(self, drop_dangling=True):
         """
@@ -958,7 +1136,10 @@ class WireAnalysis:
             p = np.asarray(p)
             c = p.mean(axis=0)
             path = resample_polyline(p, 3.0)
-            L.add_node(i, x=float(c[0]), y=float(c[1]), length=polyline_length(p),
+            meas = self.measurements[i] if getattr(self, "measurements", None) else {}
+            extra = {k: (float(v) if not isinstance(v, bool) else v) for k, v in meas.items()
+                     if k != "length" and not (isinstance(v, float) and np.isnan(v))}
+            L.add_node(i, x=float(c[0]), y=float(c[1]), length=polyline_length(p), **extra,
                        x0=float(p[0, 0]), y0=float(p[0, 1]),
                        x1=float(p[-1, 0]), y1=float(p[-1, 1]),
                        path=";".join(f"{x:.1f},{y:.1f}" for x, y in path))
@@ -1057,7 +1238,7 @@ class WireAnalysis:
                           n_orientations=16, seed_threshold=None, low_threshold=None,
                           max_gap=2, join_distance=None, min_length=None,
                           contact_distance=None, end_tolerance=None, extend_ends=True,
-                          continuity_length=None, exclude_mask=None,
+                          continuity_length=None, exclude_mask=None, pixel_size=None,
                           keep_scores=False, verbose=False):
         """Run the whole pipeline. Returns ``self.L``."""
         import time
@@ -1088,6 +1269,7 @@ class WireAnalysis:
         self.find_contacts(contact_distance=contact_distance, end_tolerance=end_tolerance)
         log(f"{len(self.contacts)} wire-wire contacts, "
             f"{len(self.electrode_contacts)} electrode contacts.")
+        self.measure_wires(pixel_size=pixel_size)
         self.build_graphs(drop_dangling=clean_network)
         log(f"Wire graph: {self.L.number_of_nodes()} nodes, {self.L.number_of_edges()} edges.")
         if not keep_scores:

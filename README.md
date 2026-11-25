@@ -100,7 +100,7 @@ Main options (`python main.py -h` lists them all):
 | `--output` | Path of the `.graphml` (defaults to next to the image). |
 | `--graph {line,spatial}` | Graph to save: line graph (nodes = wires, default) or spatial graph (nodes = junctions / contacts). |
 | `--no-clean` | Keep dangling parts: wires with fewer than two contacts (`wires`), degree-1 and degree-2 nodes (`skeleton`). |
-| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
+| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude`, `--pixel-size`, `--measurements` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
 | `--opening-radius`, `--closing-radius`, `--min-object-size` | Cleaning before skeletonizing (see *Binarization and cleaning parameters*). |
 | `--stitch TILES_DIR` | Stitch the tiles in that folder with Fiji first (with `--method skeleton` it implies `--binarize`). |
 | `--fiji`, `--stitch-mode {unknown,positions}`, `--fiji-memory` | Fiji location, stitching mode and Java memory. |
@@ -136,6 +136,12 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoint
 | `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI: *Paint areas to ignore* in tab 4. |
 
 Wires must be brighter than the background (optical dark field, SEM), otherwise use `invert`. It also accepts a binary image (it is blurred first), but it is more faithful on the original micrograph, where crossing wires can still be told apart. The orientation scores are computed by tiles and cached, so memory stays at a few bytes per pixel even for very large mosaics; the M4 sample (2767 × 2424 px) takes about 20 s.
+
+**Measurements.** Each wire node of `L` also has `width` and `truncated` (and `length_um`, `width_um` with `--pixel-size`). `--measurements wires.csv` saves one row per wire (id, degree, length, width, truncated) and the command line prints the medians.
+
+* `length` (px) is measured along the center line, without the bridges added at the ends and cutting each tip where the brightness falls below half of the wire's contrast. On the synthetic images it is within 2–3 % of the true length (median) for wires recovered whole. A wire split in pieces by the tracer gives two shorter lengths, so in very dense areas the distribution is biased towards short wires.
+* `truncated` marks wires with an end at the image border, an electrode, an excluded area or an empty mosaic margin: they may continue beyond what is seen, so their length is a lower bound. The printed length statistics leave them out.
+* `width` (px) is the full width at half maximum of the intensity profile across the wire (median along it), measured only where no other wire is closer than 2 widths, so dense networks give it for a fraction of the wires. **In optical images of nanowires thinner than the resolution it is the width of the blurred image, not the diameter**: it tells the resolution and the focus, not the wire. It is meaningful as a diameter in SEM images where wires are many pixels wide.
 
 **How faithful is it?** `benchmarks/` generates synthetic dark-field micrographs of curved wires with known positions (`synthetic.py`) and scores each method against them (`evaluate.py`). *Whole wires* is the fraction of the true wires that are recovered as a single node covering at least 80 % of their length; *nodes / wire* is the mean number of nodes on each recovered wire (1 is ideal); *spurious* are nodes that do not lie on a single wire (for wire tracing, mostly two wires chained together where one ends next to the other).
 
@@ -358,6 +364,7 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`join(max_distance=None, max_angle_deg=20)`**: joins pieces of the same wire; result in `wires`.
 * **`extend_ends(max_extension=None, min_response=None)`**: closes the small gap between a wire's end and the wire it runs into.
 * **`find_contacts(contact_distance=None, end_tolerance=None)`**: `contacts` (i, j, x, y) and `electrode_contacts`.
+* **`measure_wires(step=2.0, pixel_size=None)`**: `measurements`, one dict per wire with `length`, `width`, `truncated`; `measurement_table(path)` writes them as CSV and `measurement_summary()` gives medians and quartiles.
 * **`build_graphs(drop_dangling=True)`**: builds `L` (and `L_full` before cleaning) and `G`.
 * **`save_graph(path, save_line_graph=True)`**: exports `L` or `G` to `.graphml` (with `x`/`y` on every node).
 * **`complete_analysis(electrodes_path=None, clean_network=True, save_graph_path=None, ...)`**: runs everything.

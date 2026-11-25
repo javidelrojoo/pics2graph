@@ -1122,6 +1122,11 @@ class Pics2GraphWidget(QWidget):
                    f"L: {n_w} wires, {L.number_of_edges() - n_vin - n_vout} contacts "
                    f"({len(SA.wires)} wires found before cleaning)\n"
                    f"G: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+            if getattr(SA, "measurements", None):
+                st = SA.measurement_summary()
+                lq, wq = st["length_q"], st["width_q"]
+                txt += (f"\nLength (complete wires) median {lq[1]:.0f} px [{lq[0]:.0f}-{lq[2]:.0f}], "
+                        f"width {wq[1]:.2f} px; {st['n_truncated']} wires truncated")
             if self.g_view.currentIndex() == 0:
                 self.g_view.setCurrentIndex(2)
         else:
