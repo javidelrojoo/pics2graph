@@ -169,6 +169,27 @@ def estimate_wire_width(img, n=3000, seed=0):
     return float(np.sqrt(max(fwhm ** 2 - 3.5, 1.0)))
 
 
+def line_opening(img, length, n_orientations=16):
+    """
+    Maximum over ``n_orientations`` of the grayscale opening of ``img`` with a
+    straight segment of ``length`` px. A pixel keeps its brightness only if a
+    segment that long fits through bright pixels: wires survive (they are
+    continuous along their direction), isolated spots and rows of spots with
+    darker gaps between them do not.
+    """
+    img = np.asarray(img)
+    L = int(round(length)) | 1
+    c = L // 2
+    out = np.zeros_like(img)
+    for th in np.arange(n_orientations) * np.pi / n_orientations:
+        k = np.zeros((L, L), np.uint8)
+        dx, dy = np.cos(th) * c, np.sin(th) * c
+        cv2.line(k, (int(round(c - dx)), int(round(c - dy))),
+                 (int(round(c + dx)), int(round(c + dy))), 1, 1)
+        np.maximum(out, cv2.morphologyEx(img, cv2.MORPH_OPEN, k), out=out)
+    return out
+
+
 def empty_margin_mask(img, grow=5, min_area=2000):
     """
     Empty areas of a stitched mosaic: regions that are exactly 0, touch the
@@ -298,6 +319,7 @@ class WireAnalysis:
         if self.is_binary:
             self.img = cv2.GaussianBlur(self.img, (0, 0), max(0.7, 0.4 * self.wire_width))
         self.has_electrodes = False
+        self.exclude_mask = None
         self.wires = []
 
     # ------------------------------------------------------------------ input
@@ -309,9 +331,20 @@ class WireAnalysis:
         self.electrode_mask2 = remove_small_objects(m2, max_size=500)
         self.has_electrodes = True
 
+    def load_exclusion(self, mask):
+        """
+        Areas to ignore (path or array; nonzero = ignore), e.g. a region of
+        dust or substrate outside the network that is still traced. No wire is
+        traced inside them.
+        """
+        m = _load_mask(mask) > 0
+        if m.shape != self.img.shape[:2]:
+            raise ValueError(f"The exclusion mask is {m.shape}, the image {self.img.shape[:2]}.")
+        self.exclude_mask = m if self.exclude_mask is None else (self.exclude_mask | m)
+
     # ------------------------------------------------------ 1. orientation scores
     def orientation_scores(self, n_orientations=16, sigma_across=None, sigma_along=None,
-                           tile_size=256, max_cache_mb=1024):
+                           tile_size=256, max_cache_mb=1024, continuity_length=None):
         """
         Set up the orientation scores: the ridge response of every pixel along
         each of ``n_orientations`` directions, in gray levels of wire contrast.
@@ -326,6 +359,19 @@ class WireAnalysis:
         sa = sigma_across or max(0.8, 0.35 * w)
         sl = sigma_along or max(3.0, 1.3 * w)
         self.sigma_across, self.sigma_along = sa, sl
+        # Continuity: how much of each pixel's contrast survives an opening by
+        # line segments of length L (~1 on a wire, ~0 on dots and rows of dots
+        # with gaps). Used to judge seeds and traces, not to filter the image.
+        L = continuity_length if continuity_length is not None else 5 * w
+        self.continuity_length = L
+        self._src = self.img
+        if L and L >= 3:
+            r_bg = int(round(1.5 * w)) + 1
+            disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_bg + 1,) * 2)
+            self._bg = cv2.morphologyEx(self.img, cv2.MORPH_OPEN, disk)
+            self._cont = line_opening(self.img, L, n_orientations)
+        else:
+            self._bg = self._cont = None
         K = int(n_orientations)
         if K > 32:
             raise ValueError("n_orientations must be <= 32.")
@@ -343,6 +389,8 @@ class WireAnalysis:
         self._cache_max = max(4, int(max_cache_mb * 2 ** 20 // tile_bytes))
         self._cache = OrderedDict()
         inside = (self.electrode_mask1 | self.electrode_mask2) if self.has_electrodes else None
+        if self.exclude_mask is not None:
+            inside = self.exclude_mask if inside is None else (inside | self.exclude_mask)
         margin = empty_margin_mask(self.img, int(round(2 * sa + w)))
         self.margin_mask = margin
         if margin is not None:
@@ -384,7 +432,7 @@ class WireAnalysis:
         y1, x1 = min(y0 + T + 1, H), min(x0 + T + 1, W)
         ya, yb = max(y0 - P, 0), min(y1 + P, H)
         xa, xb = max(x0 - P, 0), min(x1 + P, W)
-        crop = self.img[ya:yb, xa:xb].astype(np.float32)
+        crop = self._src[ya:yb, xa:xb].astype(np.float32)
         top, left = P - (y0 - ya), P - (x0 - xa)
         bottom, right = P - (yb - y1), P - (xb - x1)
         if top or left or bottom or right:
@@ -587,7 +635,7 @@ class WireAnalysis:
 
     def trace(self, seed_threshold=None, low_threshold=None, step=1.5, max_turn_deg=4,
               max_gap=2, search=0.5, window=1, memory=None, recovery=2, smooth=5, pass_length=None,
-              min_length=None, max_length=20000, max_isotropy=0.5):
+              min_length=None, max_length=20000, max_isotropy=0.5, min_continuity=0.6):
         """
         Trace every wire. Thresholds are in gray levels of wire contrast;
         by default they adapt to the noise of the image (seed: max(10, 6 noise),
@@ -619,6 +667,11 @@ class WireAnalysis:
             blk = Rmax[a:b].astype(np.float32)
             pk = (blk >= high) & (blk == cv2.dilate(blk, k3))
             pk &= Rperp[a:b].astype(np.float32) <= max_isotropy * blk
+            if self._cont is not None:
+                bgb = self._bg[a:b].astype(np.float32)
+                cb = self.img[a:b].astype(np.float32) - bgb
+                ob = self._cont[a:b].astype(np.float32) - bgb
+                pk &= ob >= min_continuity * cb
             pk[:r0 - a] = False
             pk[min(r0 + band, H) - a:] = False
             y, x = np.nonzero(pk)
@@ -648,12 +701,28 @@ class WireAnalysis:
             # even if it is short (so its seeds are not traced again)
             self._mark(pts, occ_r)
             if len(pts) >= 2 and polyline_length(pts) >= 0.5 * min_length \
-                    and self._isotropy(pts) <= max_isotropy:
+                    and self._isotropy(pts) <= max_isotropy \
+                    and self._continuity(pts) >= min_continuity:
                 wires.append(pts)
         self.raw_wires = wires
         self.wires = [w_ for w_ in wires]
         self.min_length = min_length
         return wires
+
+    def _continuity(self, pts):
+        """Median fraction of the contrast along a trace that survives the line opening."""
+        if self._cont is None:
+            return 1.0
+        H, W = self.img.shape
+        P = np.round(np.asarray(pts)).astype(int)
+        xi, yi = np.clip(P[:, 0], 0, W - 1), np.clip(P[:, 1], 0, H - 1)
+        bg = self._bg[yi, xi].astype(np.float32)
+        c = self.img[yi, xi].astype(np.float32) - bg
+        o = self._cont[yi, xi].astype(np.float32) - bg
+        ok = c > 3
+        if not ok.any():
+            return 0.0
+        return float(np.median(np.clip(o[ok] / c[ok], 0, 1)))
 
     def _isotropy(self, pts):
         """Median of R_perp / R_max along a trace: ~0 for a wire, ~1 for spots."""
@@ -979,7 +1048,7 @@ class WireAnalysis:
         """Drop the cached orientation scores and the occupancy map."""
         if hasattr(self, "_cache"):
             self._cache.clear()
-        for a in ("occupancy",):
+        for a in ("occupancy", "_cont", "_bg"):
             if hasattr(self, a):
                 delattr(self, a)
 
@@ -988,6 +1057,7 @@ class WireAnalysis:
                           n_orientations=16, seed_threshold=None, low_threshold=None,
                           max_gap=2, join_distance=None, min_length=None,
                           contact_distance=None, end_tolerance=None, extend_ends=True,
+                          continuity_length=None, exclude_mask=None,
                           keep_scores=False, verbose=False):
         """Run the whole pipeline. Returns ``self.L``."""
         import time
@@ -1000,7 +1070,11 @@ class WireAnalysis:
         if electrodes_path:
             self.load_electrodes(*electrodes_path)
             log("Electrode masks loaded.")
-        self.orientation_scores(n_orientations=n_orientations)
+        if exclude_mask is not None:
+            self.load_exclusion(exclude_mask)
+            log("Exclusion mask loaded.")
+        self.orientation_scores(n_orientations=n_orientations,
+                                continuity_length=continuity_length)
         log(f"Orientation scores ({n_orientations} orientations), noise = {self.noise:.1f}.")
         self.trace(seed_threshold=seed_threshold, low_threshold=low_threshold,
                    max_gap=max_gap, min_length=min_length)

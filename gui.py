@@ -96,6 +96,7 @@ PHOTO = "electrode photo (aligned)"
 SKELETON = "skeleton"
 WIRES = "wires"
 DANGLING = "wires left out (dead ends)"
+EXCLUDE = "areas to ignore"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
@@ -192,6 +193,16 @@ def _combo(items, current=None):
     w.setMinimumContentsLength(8)
     if current is not None:
         w.setCurrentText(current)
+    return w
+
+
+def _hbox(*widgets):
+    """Widgets side by side, in a QWidget that fits in a form row."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    for x in widgets:
+        lay.addWidget(x)
     return w
 
 
@@ -916,6 +927,14 @@ class Pics2GraphWidget(QWidget):
         self.g_contact.setToolTip("Two wires touch when their center lines come this close (px);\n"
                                   "auto = 0.8 x wire width.")
         self.g_invert = QCheckBox("Wires darker than background (bright field)")
+        self.btn_exclude = QPushButton("Paint areas to ignore")
+        self.btn_exclude.setToolTip(
+            "Creates the 'areas to ignore' layer and selects the brush: paint over dust,\n"
+            "rows of dots or substrate outside the network that get traced as wires.\n"
+            "Then extract the graph again.")
+        self.btn_exclude.clicked.connect(self.paint_exclusion)
+        self.btn_exclude_clear = QPushButton("Clear")
+        self.btn_exclude_clear.clicked.connect(self.clear_exclusion)
         wf.addRow("Wire width (px)", self.g_width)
         wf.addRow("Start contrast", self.g_seed)
         wf.addRow("End contrast", self.g_low)
@@ -923,6 +942,7 @@ class Pics2GraphWidget(QWidget):
         wf.addRow("Join distance (px)", self.g_join)
         wf.addRow("Contact distance (px)", self.g_contact)
         wf.addRow(self.g_invert)
+        wf.addRow(_hbox(self.btn_exclude, self.btn_exclude_clear))
 
         self.g_skel_box = QGroupBox("Skeleton")
         f_outer = f
@@ -990,6 +1010,32 @@ class Pics2GraphWidget(QWidget):
         self._update_method()
         return w
 
+    def paint_exclusion(self):
+        layer = self._layer(EXCLUDE)
+        if layer is None:
+            shape = self._shape()
+            if shape is None:
+                self._say("Open an image first (tab 1).", "warning")
+                return
+            layer = self.viewer.add_labels(np.zeros(shape, np.uint8), name=EXCLUDE, opacity=0.4)
+            layer.brush_size = 40
+        self.viewer.layers.selection.active = layer
+        layer.selected_label = 1
+        layer.mode = "paint"
+        self._say("Paint the areas to ignore, then extract the graph again.")
+
+    def clear_exclusion(self):
+        layer = self._layer(EXCLUDE)
+        if layer is not None:
+            layer.data = np.zeros_like(layer.data)
+
+    def exclusion_mask(self):
+        layer = self._layer(EXCLUDE)
+        if layer is None:
+            return None
+        data = np.asarray(layer.data) > 0
+        return data if data.any() else None
+
     def _update_method(self, *_):
         wires = self.g_method.currentIndex() == 0
         self.g_wire_box.setVisible(wires)
@@ -1047,6 +1093,7 @@ class Pics2GraphWidget(QWidget):
         width, seed, low = auto(self.g_width), auto(self.g_seed), auto(self.g_low)
         join, contact = auto(self.g_join), auto(self.g_contact)
         gap, invert, clean = self.g_gap.value(), self.g_invert.isChecked(), self.g_clean.isChecked()
+        exclude = self.exclusion_mask()
         raw_path = self.raw_path
 
         def job():
@@ -1054,7 +1101,8 @@ class Pics2GraphWidget(QWidget):
             WA.original_img_path = raw_path
             WA.complete_analysis(electrodes_path=masks, clean_network=clean,
                                  seed_threshold=seed, low_threshold=low, max_gap=gap,
-                                 join_distance=join, contact_distance=contact)
+                                 join_distance=join, contact_distance=contact,
+                                 exclude_mask=exclude)
             return WA
 
         self._run(job, self._graph_done, self.btn_extract,

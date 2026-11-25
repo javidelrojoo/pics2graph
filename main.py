@@ -109,6 +109,9 @@ def parse_args():
     w.add_argument("--contact-distance", type=float, default=None,
                    help="Center lines closer than this are in contact "
                         "(default: 0.8 x wire width).")
+    w.add_argument("--exclude", metavar="MASK", default=None,
+                   help="Mask of areas to ignore (white = ignore), e.g. dust or substrate "
+                        "outside the network.")
     w.add_argument("--orientations", type=int, default=16,
                    help="Number of orientation layers (default 16).")
 
@@ -203,6 +206,7 @@ def main():
             max_gap=args.max_gap,
             join_distance=args.join_distance,
             contact_distance=args.contact_distance,
+            exclude_mask=args.exclude,
             verbose=verbose,
         )
     else:

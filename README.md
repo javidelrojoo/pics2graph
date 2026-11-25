@@ -100,7 +100,7 @@ Main options (`python main.py -h` lists them all):
 | `--output` | Path of the `.graphml` (defaults to next to the image). |
 | `--graph {line,spatial}` | Graph to save: line graph (nodes = wires, default) or spatial graph (nodes = junctions / contacts). |
 | `--no-clean` | Keep dangling parts: wires with fewer than two contacts (`wires`), degree-1 and degree-2 nodes (`skeleton`). |
-| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
+| `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
 | `--opening-radius`, `--closing-radius`, `--min-object-size` | Cleaning before skeletonizing (see *Binarization and cleaning parameters*). |
 | `--stitch TILES_DIR` | Stitch the tiles in that folder with Fiji first (with `--method skeleton` it implies `--binarize`). |
 | `--fiji`, `--stitch-mode {unknown,positions}`, `--fiji-memory` | Fiji location, stitching mode and Java memory. |
@@ -114,7 +114,7 @@ Main options (`python main.py -h` lists them all):
 
 1. **Orientation scores.** The image is filtered with a bank of elongated ridge filters (second derivative of an anisotropic Gaussian) at 16 orientations. For every pixel this gives how strongly a wire runs through it *in each direction*, in gray levels of contrast above the local background (a smooth background gives no response, so uneven illumination does not matter). Where two wires cross, each one keeps responding in its own orientation.
 2. **Tracing.** Starting from the strongest ridge points, each wire is followed in both directions in steps of 1.5 px, re-centered on its ridge, looking only at orientations close to its current heading and with a limited curvature. At a crossing the other wire is in a different orientation, so the tracer goes straight through. Short dim stretches are bridged (`max_gap`), sharper bends are tried when the ridge is lost straight ahead, and a wire already traced in the same direction is not traced again.
-   Two kinds of bright structure that are not wires are ignored: round spots (dust, particles, blurred dots), which respond as much across as along any direction, cannot start a wire and traces that run mostly over them are dropped; and the empty margins of a stitched mosaic (regions that are exactly 0 and touch the border), whose straight edges would otherwise be traced as wires.
+   Bright structure that is not a wire is ignored. Round spots (dust, particles, blurred dots) respond as much across as along any direction, so they cannot start a wire. Rows of spots can look like a line, but they are not *continuous*: a grayscale opening of the image with straight segments of 5 × width, in every orientation, keeps the contrast of wires and erases spots and rows of spots with darker gaps; seeds and traces must keep at least 60 % of their contrast after it. Last, the empty margins of a stitched mosaic (regions that are exactly 0 and touch the border), whose straight edges would otherwise be traced as wires.
 3. **Joining.** Pieces of the same wire that could not be followed in one go (shallow crossings, bright clumps, dim spots) are joined when their ends are close and their directions continue smoothly.
 4. **Ends.** The tracer tends to stop a few px short of a junction, where the other wire distorts the ridge. Each end that does not touch anything is extended straight ahead, up to 3 × width, as long as the image stays bright; if it reaches another wire, the gap is closed.
 5. **Contacts.** Two wires touch when their center lines come within `contact_distance` (crossings, side contacts) or an end of one is within `end_tolerance` of the other (a wire ending on another). Wires touching an electrode mask get `Vin_i` / `Vout_i` neighbors, named as before, so the downstream code that looks for `"Vin"` / `"Vout"` in the node names keeps working.
@@ -133,6 +133,7 @@ Each node of `L` stores the wire's centroid (`x`, `y`), `length` in px, endpoint
 | `join_distance` / `--join-distance` | 4 × width | Raise it if wires stay split at crossings; lower it if different wires get chained. |
 | `contact_distance` / `--contact-distance` | 0.8 × width | Distance between center lines counted as contact. |
 | `invert` / `--invert` | off | Wires darker than the background (bright field). |
+| `exclude_mask` / `--exclude` | none | Mask (white = ignore) of areas that are still traced but are not part of the network, such as dust or substrate around it. In the GUI: *Paint areas to ignore* in tab 4. |
 
 Wires must be brighter than the background (optical dark field, SEM), otherwise use `invert`. It also accepts a binary image (it is blurred first), but it is more faithful on the original micrograph, where crossing wires can still be told apart. The orientation scores are computed by tiles and cached, so memory stays at a few bytes per pixel even for very large mosaics; the M4 sample (2767 × 2424 px) takes about 20 s.
 
@@ -351,6 +352,7 @@ SA.save_graph("output.graphml", save_line_graph=True)
 
 * **`WireAnalysis(img_path=None, img=None, wire_width=None, invert=False)`**: loads the micrograph (path or array, gray or color). `wire_width=None` measures it with `estimate_wire_width`.
 * **`load_electrodes(path1, path2)`**: Vin and Vout masks (paths or arrays); no wire is traced inside them.
+* **`load_exclusion(mask)`**: areas to ignore (path or array, nonzero = ignore).
 * **`orientation_scores(n_orientations=16, sigma_across=None, sigma_along=None, tile_size=256, max_cache_mb=1024)`**: sets up the ridge responses per orientation (computed by tiles on demand) and the best response per pixel (`R_max`, `R_arg`).
 * **`trace(seed_threshold=None, low_threshold=None, step=1.5, max_turn_deg=4, max_gap=2, ...)`**: follows every wire; `raw_wires` holds the traced pieces.
 * **`join(max_distance=None, max_angle_deg=20)`**: joins pieces of the same wire; result in `wires`.
@@ -378,4 +380,4 @@ All plotting functions accept either a `SkeletonAnalysis` or a `WireAnalysis`.
 * The project uses `opencv-python-headless` (OpenCV without its own windows), which avoids Qt conflicts with napari. If you already had `opencv-python` installed, uninstall it first: `pip uninstall opencv-python`.
 * The input image to `SkeletonAnalysis` must be binarized (wires in white), preferably as `.tif`.
 * Compatible with scikit-image both before and after 0.26 (change from `min_size`/`area_threshold` to `max_size`).
-* With the example sample, `python main.py --method skeleton` reproduces the thesis' `M4_effective.graphml` (6703 nodes and 13242 edges in the line graph). On the original M4 micrograph (`muestras/M4/M4.tif` in the thesis repository) with the same electrodes, wire tracing gives about 6000 wires and 20000 contacts.
+* With the example sample, `python main.py --method skeleton` reproduces the thesis' `M4_effective.graphml` (6703 nodes and 13242 edges in the line graph). On the original M4 micrograph (`muestras/M4/M4.tif` in the thesis repository) with the same electrodes, wire tracing gives about 4900 wires and 16900 contacts; most of the difference with earlier versions are false traces over the fields of dust outside the sample, now discarded.
