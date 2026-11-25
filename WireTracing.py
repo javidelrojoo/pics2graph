@@ -169,6 +169,31 @@ def estimate_wire_width(img, n=3000, seed=0):
     return float(np.sqrt(max(fwhm ** 2 - 3.5, 1.0)))
 
 
+def empty_margin_mask(img, grow=5, min_area=2000):
+    """
+    Empty areas of a stitched mosaic: regions that are exactly 0, touch the
+    image border and cover at least ``min_area`` px, grown by ``grow`` px.
+    Their straight edges would otherwise be traced as wires. None if there
+    are none.
+    """
+    zero = (np.asarray(img) == 0).astype(np.uint8)
+    if not zero.any():
+        return None
+    n, lab, st, _ = cv2.connectedComponentsWithStats(zero, connectivity=8)
+    H, W = zero.shape
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if area >= min_area and (x == 0 or y == 0 or x + w == W or y + h == H):
+            keep[i] = True
+    if not keep.any():
+        return None
+    mask = keep[lab].astype(np.uint8)
+    if grow > 0:
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2))
+    return mask.astype(bool)
+
+
 # -----------------------------------------------------------------------------
 # Geometry helpers
 # -----------------------------------------------------------------------------
@@ -317,19 +342,31 @@ class WireAnalysis:
         tile_bytes = K * (min(self._tile, H) + 1) * (min(self._tile, W) + 1) * 2
         self._cache_max = max(4, int(max_cache_mb * 2 ** 20 // tile_bytes))
         self._cache = OrderedDict()
-        self._inside = (self.electrode_mask1 | self.electrode_mask2) if self.has_electrodes else None
+        inside = (self.electrode_mask1 | self.electrode_mask2) if self.has_electrodes else None
+        margin = empty_margin_mask(self.img, int(round(2 * sa + w)))
+        self.margin_mask = margin
+        if margin is not None:
+            inside = margin if inside is None else (inside | margin)
+        self._inside = inside
 
         H, W = self.img.shape
         T = self._tile
         self.R_max = np.zeros((H, W), np.float16)
         self.R_arg = np.zeros((H, W), np.uint8)
+        self.R_perp = np.zeros((H, W), np.float16)
         for ty in range((H + T - 1) // T):
             for tx in range((W + T - 1) // T):
                 R = self._get_tile(ty, tx)
                 h, w_ = min(T, H - ty * T), min(T, W - tx * T)
                 r = R[:, :h, :w_]
-                self.R_arg[ty * T:ty * T + h, tx * T:tx * T + w_] = r.argmax(0)
-                self.R_max[ty * T:ty * T + h, tx * T:tx * T + w_] = r.max(0)
+                arg = r.argmax(0)
+                sl_ = (slice(ty * T, ty * T + h), slice(tx * T, tx * T + w_))
+                self.R_arg[sl_] = arg
+                self.R_max[sl_] = r.max(0)
+                # response across the best orientation: ~0 on a wire, as large
+                # as R_max on a round spot (dust, a particle, a blurred dot)
+                perp = ((arg.astype(np.intp) + K // 2) % K)[None]
+                self.R_perp[sl_] = np.take_along_axis(r, perp, 0)[0]
         # Noise of the response, in the same units (for automatic thresholds)
         knorm = float(np.sqrt((self._kernels[0] ** 2).sum()))
         self.noise = estimate_noise(self.img) * knorm
@@ -550,7 +587,7 @@ class WireAnalysis:
 
     def trace(self, seed_threshold=None, low_threshold=None, step=1.5, max_turn_deg=4,
               max_gap=2, search=0.5, window=1, memory=None, recovery=2, smooth=5, pass_length=None,
-              min_length=None, max_length=20000):
+              min_length=None, max_length=20000, max_isotropy=0.5):
         """
         Trace every wire. Thresholds are in gray levels of wire contrast;
         by default they adapt to the noise of the image (seed: max(10, 6 noise),
@@ -573,6 +610,7 @@ class WireAnalysis:
 
         # seeds: local maxima of the best response above the seed threshold
         Rmax = self.R_max
+        Rperp = self.R_perp
         ys, xs, vs = [], [], []
         band = 512
         k3 = np.ones((3, 3), np.uint8)
@@ -580,6 +618,7 @@ class WireAnalysis:
             a, b = max(r0 - 1, 0), min(r0 + band + 1, H)
             blk = Rmax[a:b].astype(np.float32)
             pk = (blk >= high) & (blk == cv2.dilate(blk, k3))
+            pk &= Rperp[a:b].astype(np.float32) <= max_isotropy * blk
             pk[:r0 - a] = False
             pk[min(r0 + band, H) - a:] = False
             y, x = np.nonzero(pk)
@@ -608,12 +647,22 @@ class WireAnalysis:
             # Mark the wire as traced, in the orientation layers it occupies,
             # even if it is short (so its seeds are not traced again)
             self._mark(pts, occ_r)
-            if len(pts) >= 2 and polyline_length(pts) >= 0.5 * min_length:
+            if len(pts) >= 2 and polyline_length(pts) >= 0.5 * min_length \
+                    and self._isotropy(pts) <= max_isotropy:
                 wires.append(pts)
         self.raw_wires = wires
         self.wires = [w_ for w_ in wires]
         self.min_length = min_length
         return wires
+
+    def _isotropy(self, pts):
+        """Median of R_perp / R_max along a trace: ~0 for a wire, ~1 for spots."""
+        H, W = self.img.shape
+        P = np.round(np.asarray(pts)).astype(int)
+        xi, yi = np.clip(P[:, 0], 0, W - 1), np.clip(P[:, 1], 0, H - 1)
+        rm = self.R_max[yi, xi].astype(np.float32)
+        rp = self.R_perp[yi, xi].astype(np.float32)
+        return float(np.median(rp / np.maximum(rm, 1e-3)))
 
     def _mark(self, pts, radius):
         """Set the occupancy bits along a traced wire (its layer and the two next)."""
