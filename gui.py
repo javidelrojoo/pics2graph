@@ -115,6 +115,19 @@ SCALE_LINE = "scale bar"
 EDGES = "graph edges"
 NODES = "graph nodes"
 
+
+def _hms(seconds):
+    """A duration as '45 s', '16 min 33 s' or '1 h 05 min 12 s'."""
+    t = int(round(max(seconds, 0)))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} h {m:02d} min {s:02d} s"
+    if m:
+        return f"{m} min {s:02d} s"
+    return f"{s} s"
+
+
 VIN, VOUT = 1, 2            # label values in the electrodes layer
 
 # Binarization presets: (block size, C, intensity threshold, opening radius,
@@ -321,9 +334,9 @@ class Pics2GraphWidget(QWidget):
         txt = f"{stage}: {detail}" if detail else stage
         if frac > 0.05:
             left = el * (1 - frac) / frac
-            txt += f"  ({el:.0f} s, about {left:.0f} s left)"
+            txt += f"  ({_hms(el)}, about {_hms(left)} left)"
         else:
-            txt += f"  ({el:.0f} s)"
+            txt += f"  ({_hms(el)})"
         self.status.setText(txt)
         self.progress_bar.setValue(int(round(1000 * frac)))
         self.progress_bar.setFormat(f"{100 * frac:.0f} %  {stage}")
