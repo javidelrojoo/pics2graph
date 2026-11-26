@@ -306,6 +306,7 @@ class WireAnalysis:
             if img.ndim == 3:
                 img = cv2.cvtColor(img[..., :3], cv2.COLOR_BGR2RGB)
         self.img = _as_gray_uint8(img)
+        self.invert = bool(invert)
         if invert:
             self.img = 255 - self.img
         # A binary image has flat-topped wires with sharp edges, which give two
@@ -1462,6 +1463,8 @@ class WireAnalysis:
         """Undo ``remove_wires`` for ``ids`` (all of them if None)."""
         if ids is None:
             self.removed_wires = set()
+            if "_traced" in self.__dict__:
+                self._traced["removed"] = set()
         else:
             self.removed_wires -= {int(i) for i in ids}
         self._rebuild(None)
@@ -1522,6 +1525,226 @@ class WireAnalysis:
                     G.add_edge(a, b, wire=int(wire))
         self.node_coords = np.array(coords, float).reshape(-1, 2)
         return G
+
+
+    # ------------------------------------------- electrodes after the tracing
+    def _traced_state(self):
+        """
+        The wires as they were traced, kept the first time the electrodes are
+        changed after tracing, so that they can be changed again (or removed)
+        without losing what lies under the previous ones.
+        """
+        b = self.__dict__.get("_traced")
+        if b is None:
+            ext = getattr(self, "_extended_ends", None)
+            if not ext or len(ext) != len(self.wires):
+                ext = [(False, False)] * len(self.wires)
+            b = dict(wires=[np.asarray(p, float) for p in self.wires], ext=list(ext),
+                     masks=((self.electrode_mask1, self.electrode_mask2)
+                            if self.has_electrodes else None))
+            self._traced = b
+            self._origin = list(range(len(self.wires)))
+        return b
+
+    def _removed_traced(self):
+        """Wires deleted by hand, as indices of the wires as traced."""
+        b = self.__dict__.get("_traced")
+        if b is None:
+            return set(self.removed_wires)
+        origin = self._origin
+        present = set(origin)
+        return ({origin[i] for i in self.removed_wires if i < len(origin)}
+                | {o for o in b.get("removed", ()) if o not in present})
+
+    @property
+    def traced_with_electrodes(self):
+        """True if the electrodes were already used while tracing."""
+        b = self.__dict__.get("_traced")
+        return (b["masks"] is not None) if b is not None else bool(self.has_electrodes)
+
+    def apply_electrodes(self, path1=None, path2=None, clean_network=None,
+                         contact_distance=None, end_tolerance=None):
+        """
+        Add (or change, or remove with no arguments) the Vin / Vout electrodes
+        of an already traced image **without tracing it again**.
+
+        The wires traced without electrodes are cut where they enter an
+        electrode mask: the parts inside are dropped (they are the electrode,
+        or wires hidden under it), a wire that crosses an electrode becomes two
+        wires, and pieces shorter than ``min_length`` are dropped, which is
+        what tracing with the masks does (the ridge response is zeroed inside
+        them). Then the contacts, measurements and graphs are rebuilt, with
+        ``Vin_i`` / ``Vout_i`` nodes for the wires that reach each electrode.
+        Wires deleted by hand stay deleted.
+
+        Only the steps after tracing are repeated (seconds instead of
+        minutes). The result differs from tracing with the masks from the
+        start only in details at the edge of the electrodes (a wire end that
+        was trimmed or extended there).
+
+        If the image was traced with electrodes, the wires inside those masks
+        were never traced: new masks can only take more away, and removing
+        them goes back to the graph as traced.
+        """
+        base = self._traced_state()
+        removed_base = self._removed_traced()
+        base["removed"] = removed_base
+        if path1 is None and path2 is None:
+            if base["masks"] is not None:
+                self.electrode_mask1, self.electrode_mask2 = base["masks"]
+                self.has_electrodes = True
+            else:
+                self.has_electrodes = False
+                self.__dict__.pop("electrode_mask1", None)
+                self.__dict__.pop("electrode_mask2", None)
+        else:
+            if path1 is None or path2 is None:
+                raise ValueError("Pass both electrode masks (Vin and Vout), or none to remove them.")
+            self.load_electrodes(path1, path2)
+            if self.electrode_mask1.shape != self.img.shape[:2]:
+                raise ValueError(f"The electrode masks are {self.electrode_mask1.shape}, "
+                                 f"the image {self.img.shape[:2]}.")
+        H, W = self.img.shape[:2]
+        inside = (self.electrode_mask1 | self.electrode_mask2) if self.has_electrodes else None
+        min_len = getattr(self, "min_length", 0) or 0
+        wires, ext, new_origin = [], [], []
+        self._report("Finding contacts", 0, "cutting the wires at the electrodes", force=True)
+        for b_i, (p, e) in enumerate(zip(base["wires"], base["ext"])):
+            if inside is not None:
+                lo = np.floor(p.min(0)).astype(int)
+                hi = np.ceil(p.max(0)).astype(int)
+                touches = inside[max(lo[1], 0):min(hi[1], H - 1) + 1,
+                                 max(lo[0], 0):min(hi[0], W - 1) + 1].any()
+            else:
+                touches = False
+            if not touches:
+                wires.append(p)
+                ext.append(tuple(e))
+                new_origin.append(b_i)
+                continue
+            s = resample_polyline(p, 0.5)
+            xi = np.clip(np.round(s[:, 0]).astype(int), 0, W - 1)
+            yi = np.clip(np.round(s[:, 1]).astype(int), 0, H - 1)
+            out = ~inside[yi, xi]
+            d = np.diff(np.r_[0, out.astype(np.int8), 0])
+            for a, z in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+                q = s[a:z]
+                if len(q) < 2 or polyline_length(q) < min_len:
+                    continue
+                wires.append(q)
+                ext.append((bool(e[0]) and a == 0, bool(e[1]) and z == len(s)))
+                new_origin.append(b_i)
+        self.wires, self._extended_ends, self._origin = wires, ext, new_origin
+        self.removed_wires = {k for k, o in enumerate(new_origin) if o in removed_base}
+        # areas where nothing was traced (used to protect wire ends)
+        inside_all = inside
+        for m in (self.exclude_mask, getattr(self, "margin_mask", None)):
+            if m is not None:
+                inside_all = m if inside_all is None else (inside_all | m)
+        self._inside = inside_all
+        self._wires_changed()
+        self._report("Finding contacts", 0, f"{len(self.wires)} wires", force=True)
+        self._find_contacts(contact_distance if contact_distance is not None
+                            else getattr(self, "contact_distance", None),
+                            end_tolerance if end_tolerance is not None
+                            else getattr(self, "end_tolerance", None))
+        self._report("Measuring wires", 0, f"{len(self.wires)} wires", force=True)
+        self.measure_wires(pixel_size=getattr(self, "pixel_size", None))
+        self._report("Building the graph", 0, f"{len(self.contacts)} contacts", force=True)
+        if clean_network is None:
+            clean_network = getattr(self, "_drop_dangling", True)
+        self.build_graphs(drop_dangling=clean_network)
+        self._report("Building the graph", 1.0, "done", force=True)
+        return self.L
+
+    def save_wires(self, path):
+        """
+        Save the traced wires (``.npz``) to rebuild the graph later with
+        ``WireAnalysis.load_wires``, e.g. to add the electrodes, without
+        tracing the image again. Keeps the wires as traced (before any
+        ``apply_electrodes``), the tracing parameters, the areas to ignore and
+        the wires deleted by hand.
+        """
+        b = self.__dict__.get("_traced")
+        if b is None:
+            wires = [np.asarray(p, float) for p in self.wires]
+            ext = getattr(self, "_extended_ends", None) or [(False, False)] * len(wires)
+            masks = (self.electrode_mask1, self.electrode_mask2) if self.has_electrodes else None
+        else:
+            wires, ext, masks = b["wires"], b["ext"], b["masks"]
+        removed = sorted(self._removed_traced())
+        n = np.array([len(p) for p in wires], np.int64)
+        pts = np.vstack(wires).astype(np.float32) if wires else np.zeros((0, 2), np.float32)
+        H, W = self.img.shape[:2]
+        data = dict(
+            version=1, shape=np.array([H, W]), points=pts, counts=n,
+            extended=np.array(ext, bool).reshape(-1, 2), removed=np.array(removed, np.int64),
+            wire_width=self.wire_width, invert=bool(getattr(self, "invert", False)),
+            seed_threshold=getattr(self, "seed_threshold", np.nan),
+            low_threshold=getattr(self, "low_threshold", np.nan),
+            min_length=getattr(self, "min_length", 0.0) or 0.0,
+            contact_distance=getattr(self, "contact_distance", np.nan),
+            end_tolerance=getattr(self, "end_tolerance", np.nan),
+            drop_dangling=bool(getattr(self, "_drop_dangling", True)),
+            pixel_size=getattr(self, "pixel_size", None) or np.nan,
+            image=str(self.original_img_path or ""))
+        if self.exclude_mask is not None:
+            data["exclude"] = np.packbits(self.exclude_mask)
+        if masks is not None:
+            data["electrode1"] = np.packbits(masks[0])
+            data["electrode2"] = np.packbits(masks[1])
+        np.savez_compressed(path, **data)
+
+    @classmethod
+    def load_wires(cls, path, img_path=None, img=None, electrodes=None,
+                   clean_network=None, pixel_size=None, progress=None):
+        """
+        Rebuild a ``WireAnalysis`` from the wires saved by ``save_wires`` and
+        the same micrograph, without tracing it again: only contacts,
+        measurements and graphs are computed. ``electrodes`` = (Vin, Vout)
+        masks to apply (see ``apply_electrodes``); without them the electrodes
+        saved with the wires, if any, are used.
+        """
+        d = np.load(path, allow_pickle=False)
+        if img_path is None and img is None:
+            img_path = str(d["image"]) or None
+            if not img_path:
+                raise ValueError("Pass the micrograph the wires were traced on.")
+        self = cls(img_path=img_path, img=img, wire_width=float(d["wire_width"]),
+                   invert=bool(d["invert"]))
+        H, W = (int(v) for v in d["shape"])
+        if self.img.shape[:2] != (H, W):
+            raise ValueError(f"The wires were traced on an image of {H} x {W} px; "
+                             f"this one is {self.img.shape[0]} x {self.img.shape[1]} px.")
+        self.progress = progress
+        unpack = lambda a: np.unpackbits(a, count=H * W).reshape(H, W).astype(bool)  # noqa: E731
+        for k in ("seed_threshold", "low_threshold", "contact_distance", "end_tolerance"):
+            v = float(d[k])
+            if np.isfinite(v):
+                setattr(self, k, v)
+        self.min_length = float(d["min_length"])
+        if "exclude" in d:
+            self.exclude_mask = unpack(d["exclude"])
+        w = self.wire_width
+        self.margin_mask = empty_margin_mask(self.img, int(round(2 * max(0.8, 0.35 * w) + w)))
+        pts, counts = d["points"].astype(float), d["counts"]
+        cuts = np.cumsum(counts)[:-1]
+        self.wires = [p for p in np.split(pts, cuts)] if len(counts) else []
+        self._extended_ends = [tuple(map(bool, e)) for e in d["extended"]]
+        self.removed_wires = {int(i) for i in d["removed"]}
+        if "electrode1" in d:
+            self.electrode_mask1 = unpack(d["electrode1"])
+            self.electrode_mask2 = unpack(d["electrode2"])
+            self.has_electrodes = True
+        self._traced_state()["removed"] = set(self.removed_wires)
+        ps = pixel_size if pixel_size is not None else float(d["pixel_size"])
+        self.pixel_size = ps if ps and np.isfinite(ps) else None
+        self._drop_dangling = bool(d["drop_dangling"]) if clean_network is None else clean_network
+        if electrodes is not None:
+            self.apply_electrodes(*electrodes)
+        else:
+            self.apply_electrodes()
+        return self
 
     # ---------------------------------------------------------------- export
     def save_graph(self, path, save_line_graph=True):

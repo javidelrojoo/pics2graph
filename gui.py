@@ -971,6 +971,22 @@ class Pics2GraphWidget(QWidget):
         btn.clicked.connect(self.save_electrodes)
         f.addRow(btn)
         lay.addWidget(box)
+
+        self.el_reuse_box = box = QGroupBox("Already traced without electrodes?")
+        v = QVBoxLayout(box)
+        help_ = QLabel(
+            "If the wires were already traced (Results tab, or loaded with 'Load traced "
+            "wires'), the electrodes can be added to that graph without tracing again: "
+            "the wires are cut at the electrodes and only the contacts and the graph are "
+            "rebuilt (seconds). Wires deleted by hand stay deleted.")
+        help_.setWordWrap(True)
+        v.addWidget(help_)
+        self.btn_el_apply = QPushButton("Apply electrodes to the traced graph")
+        self.btn_el_apply.setToolTip("Connect the graph of the Results tab to these Vin / Vout\n"
+                                     "electrodes without tracing the wires again.")
+        self.btn_el_apply.clicked.connect(lambda: self.apply_electrodes_to_graph(self.btn_el_apply))
+        v.addWidget(self.btn_el_apply)
+        lay.addWidget(box)
         lay.addWidget(self._next_button("electrodes"))
         lay.addStretch()
         return w
@@ -1259,9 +1275,16 @@ class Pics2GraphWidget(QWidget):
         self.g_use_el.setToolTip("Connect the graph to the Vin / Vout electrodes of the Electrodes tab.")
         self.btn_extract = QPushButton("Trace wires")
         self.btn_extract.clicked.connect(self.extract_graph)
+        self.btn_load_wires = QPushButton("Load traced wires (.npz)...")
+        self.btn_load_wires.setToolTip(
+            "Rebuild the graph from wires traced before on this same micrograph\n"
+            "(saved with 'Save traced wires' in the Results tab), without tracing again.\n"
+            "With 'Use electrodes', the electrodes of the Electrodes tab are applied.")
+        self.btn_load_wires.clicked.connect(self.load_traced_wires)
         f.addRow(self.g_clean)
         f.addRow(self.g_use_el)
         f.addRow(self.btn_extract)
+        f.addRow(self.btn_load_wires)
         self.extract_box = box
 
     # -------------------------------------------------------------------------
@@ -1346,6 +1369,22 @@ class Pics2GraphWidget(QWidget):
         f.addRow(_hbox(self.btn_undo_delete, self.btn_restore))
         lay.addWidget(box)
 
+        self.g_el_box = box = QGroupBox("Electrodes (without tracing again)")
+        f = QFormLayout(box)
+        self.btn_res_apply = QPushButton("Apply electrodes of the Electrodes tab")
+        self.btn_res_apply.setToolTip(
+            "Cut the traced wires at the Vin / Vout electrodes painted or loaded in the\n"
+            "Electrodes tab and rebuild contacts and graph, without tracing again.\n"
+            "Use it again after changing the masks.")
+        self.btn_res_apply.clicked.connect(lambda: self.apply_electrodes_to_graph(self.btn_res_apply))
+        self.btn_res_remove = QPushButton("Remove electrodes")
+        self.btn_res_remove.setToolTip("Back to the graph as traced (wires under the electrodes\n"
+                                       "come back if they were traced without electrodes).")
+        self.btn_res_remove.clicked.connect(lambda: self.apply_electrodes_to_graph(
+            self.btn_res_remove, remove=True))
+        f.addRow(_hbox(self.btn_res_apply, self.btn_res_remove))
+        lay.addWidget(box)
+
         box = QGroupBox("Export")
         f = QFormLayout(box)
         self.g_save_kind = _combo(["line graph L", "spatial graph G"])
@@ -1357,6 +1396,12 @@ class Pics2GraphWidget(QWidget):
         btn.setToolTip("One row per wire of the graph: length, width (FWHM), truncated, degree;\n"
                        "also in µm when the scale is set (Image tab).")
         btn.clicked.connect(self.save_measurements)
+        f.addRow(btn)
+        self.btn_save_wires = btn = QPushButton("Save traced wires (.npz)...")
+        btn.setToolTip("Keep the traced wires to rebuild the graph later (e.g. with electrodes)\n"
+                       "without tracing again: 'Load traced wires' in the Trace wires tab, or\n"
+                       "python main.py --load-wires.")
+        btn.clicked.connect(self.save_traced_wires)
         f.addRow(btn)
         btn = QPushButton("Save figure (graph over image)...")
         btn.clicked.connect(self.save_figure)
@@ -1445,6 +1490,10 @@ class Pics2GraphWidget(QWidget):
         self.g_edit_box.setVisible(wires)
         self.g_hist_box.setVisible(wires)
         self.btn_save_meas.setVisible(wires)
+        self.btn_save_wires.setVisible(wires)
+        self.btn_load_wires.setVisible(wires)
+        self.g_el_box.setVisible(wires)
+        self.el_reuse_box.setVisible(wires)
         names = " \u2192 ".join(f"{i}. {self.TAB_TITLES[k]}" + (" (optional)" if k == "electrodes" else "")
                                 for i, k in enumerate(steps, 1))
         self.method_help.setText(
@@ -1570,6 +1619,89 @@ class Pics2GraphWidget(QWidget):
         self.draw_graph()
         self._say("Graph extracted: check it here and export it. To change the parameters, "
                   "go back to the previous tab and extract it again.")
+
+    def apply_electrodes_to_graph(self, button, remove=False):
+        """Add / change / remove the electrodes of the traced graph, without tracing again."""
+        if not self._is_wires():
+            self._say("Trace the wires first (or load traced wires).", "warning")
+            return
+        SA = self.SA
+        if remove:
+            masks = None
+        else:
+            masks = self.electrode_masks()
+            if masks is None:
+                self._say("Paint or load both electrodes (Vin and Vout) in the Electrodes tab first.",
+                          "warning")
+                return
+            if masks[0].shape != SA.img.shape[:2]:
+                self._say(f"The electrode masks {masks[0].shape} do not match the traced image "
+                          f"{SA.img.shape[:2]}.", "error")
+                return
+            if SA.traced_with_electrodes:
+                show_warning("These wires were traced with electrodes: what lay under the first "
+                             "electrodes was never traced, so new masks can only take wires away.")
+        clean = self.g_clean.isChecked()
+        pixel_size = self.pixel_size()
+        progress = self._progress_callback()
+
+        def job():
+            SA.progress = progress
+            SA.pixel_size = pixel_size
+            if masks is None:
+                SA.apply_electrodes(clean_network=clean)
+            else:
+                SA.apply_electrodes(*masks, clean_network=clean)
+            return SA
+
+        def done(SA):
+            self._graph_done(SA)
+            n_vin = sum(1 for n in SA.L if isinstance(n, str) and n.startswith("Vin_"))
+            n_vout = sum(1 for n in SA.L if isinstance(n, str) and n.startswith("Vout_"))
+            self._say("Electrodes removed: graph as traced." if masks is None else
+                      f"Electrodes applied without tracing again: {n_vin} contacts with Vin, "
+                      f"{n_vout} with Vout.")
+
+        self._run(job, done, button, "Applying the electrodes to the traced wires...", progress=True)
+
+    def save_traced_wires(self):
+        if not self._is_wires():
+            self._say("Trace the wires first.", "warning")
+            return
+        default = (os.path.splitext(self.raw_path)[0] + "_traced.npz") if self.raw_path else "traced.npz"
+        path, _ = QFileDialog.getSaveFileName(self, "Save traced wires", default, "Traced wires (*.npz)")
+        if path:
+            self.SA.set_pixel_size(self.pixel_size())
+            self.SA.save_wires(path)
+            self._say(f"Traced wires saved to {path}. Load them later with 'Load traced wires' "
+                      "(Trace wires tab) to add the electrodes without tracing again.")
+
+    def load_traced_wires(self):
+        if self.raw_gray is None:
+            self._say("Open the micrograph the wires were traced on first (Image tab).", "warning")
+            return
+        start = (os.path.splitext(self.raw_path)[0] + "_traced.npz") if self.raw_path else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Load traced wires", start, "Traced wires (*.npz)")
+        if not path:
+            return
+        masks = self.electrode_masks() if self.g_use_el.isChecked() else None
+        img, raw_path = self.raw_gray, self.raw_path
+        clean, pixel_size = self.g_clean.isChecked(), self.pixel_size()
+        progress = self._progress_callback()
+
+        def job():
+            WA = WireAnalysis.load_wires(path, img=img, electrodes=masks, clean_network=clean,
+                                         pixel_size=pixel_size, progress=progress)
+            WA.original_img_path = raw_path
+            return WA
+
+        def done(WA):
+            self._graph_done(WA)
+            self._say(f"Graph rebuilt from {os.path.basename(path)} without tracing again"
+                      + (" and with the electrodes of the Electrodes tab." if masks is not None else "."))
+
+        self._run(job, done, self.btn_load_wires, "Rebuilding the graph from the traced wires...",
+                  progress=True)
 
     def _update_stats(self):
         SA = self.SA

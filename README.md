@@ -70,7 +70,17 @@ It opens a [napari](https://napari.org) viewer with a *pics2graph* panel on the 
 * **Electrodes** (optional): paint the input electrode (Vin, red) and the output electrode (Vout, blue) with the brush, polygon or fill tools, load existing masks, or get them **from a later photo** (see *Electrodes from a later photo*). *Save masks...* writes `<name>_electrode_mask1.tif` / `_electrode_mask2.tif`, compatible with the command line.
 * **Trace wires** (wire-tracing method): the tracing parameters (wire width, start/end contrast, gap, join and contact distances; all default to *auto*), the areas to ignore (*Paint areas to ignore*, *Draw rectangles to ignore*), cleaning and electrodes, and the *Trace wires* button. When it finishes, the panel moves to *Results*.
 * **Skeleton** (skeleton method): the cleaning before skeletonizing (closing, opening, specks), cleaning and electrodes, and *Extract graph*.
-* **Results**: a summary of the graph and, with wire tracing, the median length and width of the wires (in µm too when the scale is set) and a **histogram of the wire lengths** of the final graph (complete wires; *Include truncated wires* stacks the truncated ones, whose length is only a lower bound, in gray; *Save histogram...* exports it as PNG, PDF or SVG). View the graph over the image with zoom: with wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back; the summary and the histogram follow. Export the `.graphml`, the wire measurements (*Save wire measurements (.csv)*, one row per wire), a figure or a screenshot; all of them reflect the deletions. To change the parameters, go back to the previous tab and extract the graph again.
+* **Results**: a summary of the graph and, with wire tracing, the median length and width of the wires (in µm too when the scale is set) and a **histogram of the wire lengths** of the final graph (complete wires; *Include truncated wires* stacks the truncated ones, whose length is only a lower bound, in gray; *Save histogram...* exports it as PNG, PDF or SVG). View the graph over the image with zoom: with wire tracing the *Wires* view draws each wire in its own color (hover over one to see its node id + 1), which is the quickest way to check that every node is one whole wire. False detections can be removed by hand: press *Delete wires by clicking* and click on them; each one leaves the graph with its contacts, the graph is rebuilt at once (wires left with fewer than two contacts turn gray) and *Undo* / *Restore all* bring them back; the summary and the histogram follow. Export the `.graphml`, the wire measurements (*Save wire measurements (.csv)*, one row per wire), a figure or a screenshot; all of them reflect the deletions. To change the parameters, go back to the previous tab and extract the graph again. *Electrodes (without tracing again)* and *Save traced wires (.npz)* are described in *Adding the electrodes after tracing*.
+
+### Adding the electrodes after tracing
+
+Tracing is the slow step (minutes on a large mosaic); the electrodes only matter afterwards. So the image can be traced once without electrodes and the electrodes added later, **without tracing again**: the traced wires are cut where they enter an electrode mask (the parts inside are dropped and a wire that crosses an electrode becomes two), and only the contacts, the measurements and the graph are rebuilt, which takes seconds. On a 700 × 1400 px crop of M4 this took 4 s instead of 40 s, and gave the same graph as tracing with the electrodes from the start up to the edge of the electrodes (1192 vs 1194 wires, 3096 vs 3097 edges, 99 % of the traced points within 2 px). Wires deleted by hand stay deleted.
+
+* **Same session**: trace without electrodes, paint or load them in the *Electrodes* tab and press *Apply electrodes to the traced graph* there, or *Apply electrodes of the Electrodes tab* in *Results*. Press it again after changing the masks; *Remove electrodes* goes back to the graph as traced.
+* **Later**: *Save traced wires (.npz)...* in *Results* keeps the wires; another day, open the same micrograph, set the electrodes and press *Load traced wires (.npz)...* in the *Trace wires* tab (with *Use electrodes* checked).
+* **Command line**: `--save-wires` and `--load-wires` (see below).
+
+If the wires were traced *with* electrodes, what lay under them was never traced: other masks can only take wires away. This is for wire tracing only; the skeleton method is fast enough to run again.
 
 Startup can take a while, especially the first time after installing or rebooting (Python compiles and caches napari and Qt, and on Windows the antivirus scans those files); later starts take a few seconds. A small loading window and messages in the terminal show each step meanwhile.
 
@@ -95,6 +105,12 @@ python main.py --stitch path/M5_tiles
 # reproduces the thesis' example/M4/M4_effective.graphml
 python main.py --method skeleton
 
+# Trace once without electrodes and keep the wires...
+python main.py --image path/M5.tif --save-wires path/M5_traced.npz
+# ...and add the electrodes later without tracing again (seconds)
+python main.py --image path/M5.tif --load-wires path/M5_traced.npz \
+    --electrodes path/M5_electrode_mask1.tif path/M5_electrode_mask2.tif
+
 # Skeleton method on a raw image: binarized first (saved as path/M5_binary.tif)
 python main.py --method skeleton --image path/M5.tif --binarize \
     --block-size 151 --C 15 --threshold 55
@@ -110,6 +126,7 @@ Main options (`python main.py -h` lists them all):
 | `--no-electrodes` | Ignore electrodes. |
 | `--output` | Path of the `.graphml` (defaults to next to the image). |
 | `--graph {line,spatial}` | Graph to save: line graph (nodes = wires, default) or spatial graph (nodes = junctions / contacts). |
+| `--save-wires NPZ`, `--load-wires NPZ` | Save the traced wires / rebuild the graph from them on the same `--image` without tracing again, applying `--electrodes` (see *Adding the electrodes after tracing*). |
 | `--no-clean` | Keep dangling parts: wires with fewer than two contacts (`wires`), degree-1 and degree-2 nodes (`skeleton`). |
 | `--wire-width`, `--seed-contrast`, `--min-contrast`, `--max-gap`, `--join-distance`, `--contact-distance`, `--orientations`, `--invert`, `--exclude`, `--pixel-size`, `--scale-bar`, `--scale-bar-um`, `--measurements` | Wire tracing parameters (see *Wire tracing*); all have automatic defaults. |
 | `--opening-radius`, `--closing-radius`, `--min-object-size` | Cleaning before skeletonizing (see *Binarization and cleaning parameters*). |
@@ -386,6 +403,8 @@ SA.save_graph("output.graphml", save_line_graph=True)
 * **`build_graphs(drop_dangling=True)`**: builds `L` (and `L_full` before cleaning) and `G`.
 * **`save_graph(path, save_line_graph=True)`**: exports `L` or `G` to `.graphml` (with `x`/`y` on every node).
 * **`complete_analysis(electrodes_path=None, clean_network=True, save_graph_path=None, ...)`**: runs everything.
+* **`apply_electrodes(path1=None, path2=None, clean_network=None)`**: adds or changes the electrodes of an already traced image without tracing again (cuts the wires at the masks and rebuilds contacts, measurements and graphs); with no masks it goes back to the wires as traced.
+* **`save_wires(path)`** / **`WireAnalysis.load_wires(path, img_path=None, img=None, electrodes=None, ...)`**: save the traced wires (`.npz`, with the tracing parameters, the areas to ignore and the wires deleted by hand) and rebuild the analysis from them and the same micrograph, optionally with electrodes.
 * **`remove_wires(ids)`** / **`restore_wires(ids=None)`**: delete wires by hand (false detections) and rebuild the graph; `wire_at(x, y)` gives the wire under a point. Deleted wires are kept in `removed_wires`.
 * **`wire_label_image(thickness=None, wires=None)`**: image with each wire drawn as its index + 1.
 * **`estimate_wire_width(img)`**: typical wire width in px (FWHM of the profile across the strongest ridges; distance transform for binary images).

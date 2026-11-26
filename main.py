@@ -127,6 +127,13 @@ def parse_args():
                         "degree.")
     w.add_argument("--orientations", type=int, default=16,
                    help="Number of orientation layers (default 16).")
+    w.add_argument("--save-wires", metavar="NPZ", default=None,
+                   help="Also save the traced wires, to rebuild the graph later (e.g. with "
+                        "electrodes) with --load-wires, without tracing again.")
+    w.add_argument("--load-wires", metavar="NPZ", default=None,
+                   help="Do not trace: rebuild the graph from wires saved with --save-wires "
+                        "(or from the GUI) on the same --image, applying --electrodes if "
+                        "given. Takes seconds instead of minutes.")
 
     s = p.add_argument_group("stitching (Fiji, see stitching.py for all options)")
     s.add_argument("--stitch", metavar="TILES_DIR", default=None,
@@ -224,11 +231,11 @@ def main():
             suffix = "_wires" if args.method == "wires" else ""
             output = os.path.splitext(img_path)[0] + suffix + ".graphml"
 
+    SA = None
     if args.method == "wires":
         if using_default:
             print("Note: the example in the repo is a binary image; the wire tracing "
                   "is more faithful on the original micrograph (--image path/M4.tif).")
-        SA = WireAnalysis(img_path, wire_width=args.wire_width, invert=args.invert)
         progress = _console_progress() if verbose else None
         pixel_size = args.pixel_size
         if pixel_size is None and args.scale_bar:
@@ -243,6 +250,17 @@ def main():
             pixel_size = read_pixel_size(img_path)
             if pixel_size and verbose:
                 print(f"Scale read from the image: {pixel_size:.4f} um/px.")
+        if args.load_wires:
+            SA = WireAnalysis.load_wires(
+                args.load_wires, img_path,
+                electrodes=tuple(electrodes) if electrodes else None,
+                clean_network=False if args.no_clean else None,
+                pixel_size=pixel_size, progress=progress)
+            if verbose:
+                print(f"Graph rebuilt from the wires in {args.load_wires} (not traced again)"
+                      + (", with the electrodes given." if electrodes else "."))
+    if args.method == "wires" and SA is None:
+        SA = WireAnalysis(img_path, wire_width=args.wire_width, invert=args.invert)
         if verbose:
             print(f"Wire width: {SA.wire_width:.1f} px.")
         SA.complete_analysis(
@@ -259,7 +277,7 @@ def main():
             verbose=verbose,
             progress=progress,
         )
-    else:
+    elif args.method == "skeleton":
         SA = SkeletonAnalysis(img_path)
         if SA.img is None:
             raise FileNotFoundError(f"Could not read the image: {img_path}")
@@ -274,6 +292,10 @@ def main():
             closing_radius=args.closing_radius,
         )
     SA.save_graph(output, save_line_graph=(args.graph == "line"))
+    if args.method == "wires" and args.save_wires:
+        SA.save_wires(args.save_wires)
+        if verbose:
+            print(f"Traced wires saved to {args.save_wires} (reuse them with --load-wires).")
     if args.method == "wires":
         if args.measurements:
             SA.measurement_table(args.measurements)
