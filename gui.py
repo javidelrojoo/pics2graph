@@ -152,10 +152,8 @@ IMAGE_FILTER = "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp *.JPG *.TIF);;All 
 #  I/O helpers (work with non-ASCII paths on Windows, unlike cv2.imread)
 # =============================================================================
 def imread(path, flags=-1):          # -1 == cv2.IMREAD_UNCHANGED
-    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
-    if img is None:
-        raise IOError(f"Could not read {path}")
-    return img
+    # also merges the channels of an ImageJ/Fiji composite TIFF into color
+    return er.imread(path, flags)
 
 
 def imwrite(path, img):
@@ -932,8 +930,10 @@ class Pics2GraphWidget(QWidget):
         help_ = QLabel(
             "Use a photo taken after depositing the electrodes (it may have another "
             "magnification, rotation and position). It is aligned with the open "
-            "micrograph by matching the wire network, and the two electrodes found "
-            "in it are transferred here (left/top = Vin, right/bottom = Vout).")
+            "micrograph by matching the wire network and shown as a layer, so the "
+            "electrodes can be painted over it. Unless 'Electrodes look' is 'none', the "
+            "two electrodes found in it are also transferred (left/top = Vin, "
+            "right/bottom = Vout); if they are not found, the aligned photo is still shown.")
         help_.setWordWrap(True)
         f.addRow(help_)
         row, self.el_photo = self._path_row("open", placeholder="photo with the electrodes")
@@ -943,16 +943,17 @@ class Pics2GraphWidget(QWidget):
         self.el_scale.setToolTip("Image pixels per photo pixel, e.g. 2 for a 5x photo on a 10x "
                                  "mosaic. 'auto' tries several scales (slower).")
         f.addRow("Scale", self.el_scale)
-        self.el_feature = _combo(("auto", "warm", "bright", "dark"))
+        self.el_feature = _combo(("auto", "warm", "bright", "dark", "none"))
         self.el_feature.setToolTip(
             "How the electrodes differ from the bare network in the photo:\n"
-            "warm = more reddish, bright = brighter, dark = darker, auto = best separating.")
+            "warm = more reddish, bright = brighter, dark = darker, auto = best separating,\n"
+            "none = only align the photo and paint the electrodes by hand.")
         f.addRow("Electrodes look", self.el_feature)
         self.el_sigma = _spin(1, 200, 15)
         self.el_sigma.setToolTip("Smoothing (photo px) before detecting the electrodes; "
                                  "larger than the spacing between wires.")
         f.addRow("Smoothing", self.el_sigma)
-        self.btn_el_photo = QPushButton("Align photo && detect electrodes")
+        self.btn_el_photo = QPushButton("Align photo (&& detect electrodes)")
         self.btn_el_photo.clicked.connect(self.electrodes_from_photo)
         f.addRow(self.btn_el_photo)
         lay.addWidget(box)
@@ -1059,14 +1060,17 @@ class Pics2GraphWidget(QWidget):
         layer = self._electrodes_layer()
         if layer is None:
             return
-        if layer.data.shape != m1.shape:
+        detected = m1 is not None
+        if layer.data.shape != warped.shape[:2]:
             self._say(f"The electrode layer {layer.data.shape} does not match the micrograph "
-                      f"{m1.shape}; clear it ('Create / clear electrode layer') and retry.", "error")
+                      f"{warped.shape[:2]}; clear it ('Create / clear electrode layer') and "
+                      "retry.", "error")
             return
-        data = np.zeros(m1.shape, np.uint8)
-        data[m1] = VIN
-        data[m2] = VOUT
-        layer.data = data
+        if detected:
+            data = np.zeros(m1.shape, np.uint8)
+            data[m1] = VIN
+            data[m2] = VOUT
+            layer.data = data
         self._remove(PHOTO)
         self.viewer.add_image(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB), name=PHOTO, rgb=True,
                               opacity=0.5)
@@ -1075,10 +1079,14 @@ class Pics2GraphWidget(QWidget):
                                     self.viewer.layers.index(RAW) + 1)
         self.viewer.layers.selection.active = layer
         msg = (f"Photo aligned: scale {info['scale']:.3f}, rotation {info['rotation_deg']:.2f} deg, "
-               f"{info['inliers']} matching points, residual {info['residual_median']:.2f} px. "
-               f"Electrodes detected by '{info['detect_feature']}' ({info['detect_layout']}). "
-               f"Check them against the '{PHOTO}' layer, touch them up with the tools above, "
-               "then 'Save masks...'.")
+               f"{info['inliers']} matching points, residual {info['residual_median']:.2f} px. ")
+        if detected:
+            msg += (f"Electrodes detected by '{info['detect_feature']}' ({info['detect_layout']}). "
+                    f"Check them against the '{PHOTO}' layer, touch them up with the tools above, "
+                    "then 'Save masks...'.")
+        else:
+            msg += (f"Paint the electrodes over the '{PHOTO}' layer with the tools above, "
+                    "then 'Save masks...'.")
         if info["warnings"]:
             msg += " Note: " + " ".join(info["warnings"])
         self._say(msg, "warning" if info["warnings"] else "info")

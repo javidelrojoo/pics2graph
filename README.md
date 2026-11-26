@@ -206,22 +206,24 @@ How they were chosen and what to keep in mind:
 Typical case: the network is mapped first (e.g. a 10× mosaic) and the electrodes are deposited afterwards; a new photo shows them, usually at another magnification (e.g. 5×), slightly rotated and shifted. This module transfers them to the mosaic:
 
 1. **Registration**: the same features of the wire network are found in both images (SIFT) and the similarity transform (scale + rotation + translation) from the photo to the image is fitted with RANSAC. The scale can be given or searched automatically.
-2. **Detection**: the two electrodes are found in the photo by a smoothed feature (`warm` = red minus blue, `bright`, `dark`, or `auto`, which picks the one that best separates two classes); the two largest regions are kept, ordered left→right (or top→bottom): the first is Vin, the second Vout.
-3. **Transfer**: both masks are warped to the image coordinates.
+2. **Detection** (optional): the two electrodes are found in the photo by a smoothed feature (`warm` = red minus blue, `bright`, `dark`, or `auto`, which keeps the best-separating feature among those that give two large regions; `none` skips the detection). If it fails, the alignment is still returned and the electrodes can be painted by hand over the aligned photo.
+3. **Transfer**: both masks are warped to the image coordinates and ordered left→right (or top→bottom) there, so a rotated photo does not swap them: the first is Vin, the second Vout.
 
 ```bash
-# writes JTA_Ag_O3_electrode_mask1.tif (Vin), _mask2.tif (Vout) and _electrode_check.jpg next to the image
+# writes JTA_Ag_O3_photo_aligned.tif, _electrode_mask1.tif (Vin), _mask2.tif (Vout) and _electrode_check.jpg next to the image
 python electrode_registration.py JTA_Ag_O3.tif JTA_Ag_O3_electrodes.JPG --scale 2
+# only align the photo (to paint the electrodes by hand)
+python electrode_registration.py JTA_Ag_I2.tif JTA_Ag_I2_electrodes.tif --scale 2 --feature none
 python electrode_registration.py -h
 ```
 
-In the GUI (*Electrodes* tab, *From a later photo*): choose the photo, the scale (image px per photo px, e.g. 2 for a 5× photo on a 10× mosaic, or *auto*) and how the electrodes look, then *Align photo & detect electrodes*. The electrodes layer is filled and the aligned photo is added as a semi-transparent layer to check them; touch them up with the drawing tools and *Save masks...*.
+In the GUI (*Electrodes* tab, *From a later photo*): choose the photo, the scale (image px per photo px, e.g. 2 for a 5× photo on a 10× mosaic, or *auto*) and how the electrodes look (*none* to only align), then *Align photo (& detect electrodes)*. The aligned photo is always added as a semi-transparent layer; if the electrodes were detected the electrodes layer is filled, otherwise paint them over the photo. Touch them up with the drawing tools and *Save masks...*.
 
-From Python: `electrodes_from_photo(image, photo, scale=None, feature="auto", sigma=15)` returns `(mask1, mask2, info)`; `info` holds the transform `M`, `scale`, `rotation_deg`, the number of consistent matches, the residual and warnings. Lower-level pieces: `register`, `detect_electrodes`, `warp_mask`, `warp_photo`, `check_image`.
+From Python: `electrodes_from_photo(image, photo, scale=None, feature="auto", sigma=15)` returns `(mask1, mask2, info)` (both masks `None` with `feature="none"` or if the detection fails); `info` holds the transform `M`, `scale`, `rotation_deg`, the number of consistent matches, the residual and warnings. Lower-level pieces: `register`, `detect_electrodes`, `warp_mask`, `warp_photo`, `check_image`.
 
 Notes:
 
-* The registration needs the photo to show the same network (a few hundred consistent matches are typical; at least 25 are required). On JTA_Ag_O3 (5× photo on a 10× mosaic) it found scale 1.987 and rotation −2.37° from ~2500 matches, with a median residual of 0.56 px; in synthetic tests it recovered any rotation and magnification ratios up to 5× within ~1 px.
+* The registration needs the photo to show the same network (a few hundred consistent matches are typical; at least 25 are required). On JTA_Ag_O3 (5× photo on a 10× mosaic) it found scale 1.987 and rotation −2.37° from ~2500 matches, with a median residual of 0.56 px. On JTA_Ag_I2 (gray, upside-down photo) it found scale 1.987 and rotation 179.0° from ~2500 matches, residual 0.63 px; in synthetic tests it recovered any rotation and magnification ratios up to 5× within ~1 px.
 * The detection is a starting point. If an electrode touches the border of the photo you get a warning: it may continue outside the photo, or the detection may include some bare network there. Always check the edges facing the gap, which define the contacts.
 * Under dark field the same wire can look brighter or dimmer depending on its orientation and the illumination, so the photo and the mosaic do not show exactly the same wires; this does not affect the registration.
 

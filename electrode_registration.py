@@ -47,7 +47,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-FEATURES = ("auto", "warm", "bright", "dark")
+FEATURES = ("auto", "warm", "bright", "dark", "none")
 AUTO_SCALES = (1.0, 2.0, 0.5, 3.0, 1 / 3, 4.0, 0.25)
 
 
@@ -55,10 +55,57 @@ AUTO_SCALES = (1.0, 2.0, 0.5, 3.0, 1 / 3, 4.0, 0.25)
 #  I/O helpers (non-ASCII paths on Windows)
 # =============================================================================
 def imread(path, flags=cv2.IMREAD_COLOR):
-    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
+    buf = np.fromfile(path, dtype=np.uint8)
+    img = _imagej_channels(buf)
+    if img is None:
+        img = cv2.imdecode(buf, flags)
+    elif flags == cv2.IMREAD_GRAYSCALE:
+        img = _gray(img)
+    elif flags == cv2.IMREAD_COLOR and img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     if img is None:
         raise IOError(f"Could not read {path}")
     return img
+
+
+# colors ImageJ gives to the channels of a composite image, as BGR
+_IJ_COLORS = ((0, 0, 1), (0, 1, 0), (1, 0, 0), (1, 1, 1), (1, 1, 0), (1, 0, 1), (0, 1, 1))
+
+
+def _imagej_channels(buf):
+    """
+    A multi-channel TIFF saved by ImageJ/Fiji (e.g. a "composite" RGB, stored as
+    one gray page per channel) merged into a single BGR image, with the
+    channels in ImageJ's default colors (red, green, blue, gray, cyan, magenta,
+    yellow). None if ``buf`` is not such a file. OpenCV alone reads only the
+    first page, so the photo would look gray.
+    """
+    if buf[:2].tobytes() not in (b"II", b"MM"):
+        return None
+    raw = buf.tobytes()
+    i = raw.find(b"ImageJ=")
+    if i < 0:
+        return None
+    desc = raw[i:i + 2000].split(b"\0", 1)[0].decode("ascii", "replace")
+    meta = dict(line.split("=", 1) for line in desc.splitlines() if "=" in line)
+    try:
+        channels = int(meta.get("channels", 1))
+    except ValueError:
+        return None
+    if not 2 <= channels <= len(_IJ_COLORS):
+        return None
+    ok, pages = cv2.imdecodemulti(buf, cv2.IMREAD_UNCHANGED)
+    if not ok or len(pages) < channels:
+        return None
+    pages = pages[:channels]                    # first slice / frame
+    if any(p.ndim != 2 or p.shape != pages[0].shape for p in pages):
+        return None
+    out = np.zeros(pages[0].shape + (3,), np.float64)
+    for p, color in zip(pages, _IJ_COLORS):
+        out += p[..., None].astype(np.float64) * np.array(color, np.float64)
+    dtype = pages[0].dtype
+    top = np.iinfo(dtype).max if np.issubdtype(dtype, np.integer) else out.max()
+    return np.clip(out, 0, top).astype(dtype)
 
 
 def imwrite(path, img, params=()):
@@ -216,19 +263,48 @@ def detect_electrodes(photo, feature="auto", sigma=15, n=2, min_area_frac=0.02):
     photo = np.asarray(photo)
     if photo.ndim == 2:
         photo = cv2.cvtColor(photo, cv2.COLOR_GRAY2BGR)
-    feats = ("warm", "bright", "dark") if feature == "auto" else (feature,)
     _, bright = _feature_map(photo, "bright", sigma)
     sample = bright > max(np.percentile(bright, 5) * 1.5, 1.0)   # exclude black outside the sample
     if sample.mean() < 0.2:
         sample[:] = True
-    scored = []
+    if feature == "auto":
+        feats = ["bright", "dark"]
+        b, r = photo[..., 0].astype(np.int16), photo[..., 2].astype(np.int16)
+        if np.abs(r - b).mean() > 2:                # "warm" means nothing on a gray photo
+            feats.insert(0, "warm")
+    else:
+        feats = [feature]
+
+    # "bright" and "dark" always split the histogram equally well (one is the
+    # negative of the other), so the separability alone cannot choose between
+    # them: each candidate is also segmented, and only those giving n large
+    # regions are kept. Among those, the best separability wins; near-ties
+    # go to the one whose n regions hold most of the foreground (clean pads).
+    scored, results, errors = [], [], []
     for ft in feats:
         fmap, _ = _feature_map(photo, ft, sigma)
         thr, sep = _otsu(fmap[sample])
-        scored.append((sep, ft, fmap, thr))
-    sep, ft, fmap, thr = max(scored, key=lambda x: x[0])
+        scored.append((sep, ft))
+        try:
+            masks, frac, axis = _segment(fmap > thr, sample, sigma, n, min_area_frac, ft)
+        except RuntimeError as e:
+            errors.append(str(e))
+            continue
+        results.append((sep, frac, ft, masks, axis))
+    if not results:
+        raise RuntimeError(" ".join(errors) if len(errors) == 1 else
+                           "No feature found the electrodes: " + " | ".join(errors))
+    top = max(r[0] for r in results)
+    sep, _, ft, masks, axis = max((r for r in results if r[0] >= top - 0.02), key=lambda r: r[1])
+    return masks, dict(feature=ft, separability=sep,
+                       layout="left-right" if axis == 1 else "top-bottom",
+                       scores={f: round(v, 3) for v, f in scored})
 
-    mask = (fmap > thr) & sample
+
+def _segment(mask, sample, sigma, n, min_area_frac, ft):
+    """The n largest regions of a thresholded feature map, ordered left->right
+    (or top->bottom), with the share of the foreground they hold and the axis."""
+    mask = mask & sample
     k = int(2 * round(sigma) + 1)
     mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0
@@ -242,14 +318,12 @@ def detect_electrodes(photo, feature="auto", sigma=15, n=2, min_area_frac=0.02):
     if sizes[order[-1] - 1] < min_area_frac * mask.size:
         raise RuntimeError(f"Only {sum(s >= min_area_frac * mask.size for s in sizes)} large "
                            f"region(s) found with feature '{ft}'. Try another feature.")
+    frac = float(sizes[order - 1].sum() / max(sizes.sum(), 1))
     cents = [ndimage.center_of_mass(lab == k) for k in order]
     ys, xs = [c[0] for c in cents], [c[1] for c in cents]
     axis = 1 if (max(xs) - min(xs)) >= (max(ys) - min(ys)) else 0
     order = [k for _, k in sorted(zip([c[axis] for c in cents], order))]
-    masks = [lab == k for k in order]
-    return masks, dict(feature=ft, separability=sep,
-                       layout="left-right" if axis == 1 else "top-bottom",
-                       scores={s[1]: round(s[0], 3) for s in scored})
+    return [lab == k for k in order], frac, axis
 
 
 # =============================================================================
@@ -277,16 +351,39 @@ def photo_footprint(photo_shape, M):
 def electrodes_from_photo(image, photo, scale=None, feature="auto", sigma=15, verbose=False):
     """
     Register ``photo`` on ``image`` and return the electrode masks in image
-    coordinates: (mask1, mask2, info). mask1 is the left (or top) electrode,
-    used as Vin; mask2 the right (or bottom) one, Vout.
+    coordinates: (mask1, mask2, info). mask1 is the left (or top) electrode
+    in the image, used as Vin; mask2 the right (or bottom) one, Vout.
+
+    ``feature="none"`` only aligns the photo. If the detection fails, the
+    alignment is still returned, with mask1 = mask2 = None and a warning.
 
     ``info`` holds the registration results (see ``register``), the detection
     results (see ``detect_electrodes``), ``M`` and a list of ``warnings``.
     """
     reg = register(photo, image, scale=scale, verbose=verbose)
-    photo_masks, det = detect_electrodes(photo, feature=feature, sigma=sigma)
-    masks = [warp_mask(m, reg["M"], image.shape) for m in photo_masks]
     warnings = []
+    if feature == "none":
+        photo_masks, det = None, dict(feature=None, layout=None)
+    else:
+        try:
+            photo_masks, det = detect_electrodes(photo, feature=feature, sigma=sigma)
+        except RuntimeError as e:
+            # the alignment is the main result: a failed detection only means
+            # the electrodes have to be painted by hand on the aligned photo
+            photo_masks, det = None, dict(feature=None, layout=None)
+            warnings.append(f"Electrodes not detected ({e}) Paint them by hand over the "
+                            "aligned photo.")
+    if photo_masks is None:
+        info = dict(reg, **{f"detect_{k}": v for k, v in det.items()}, warnings=warnings)
+        return None, None, info
+    masks = [warp_mask(m, reg["M"], image.shape) for m in photo_masks]
+    # order left -> right (or top -> bottom) in the image, not in the photo:
+    # a rotated photo (e.g. ~180 deg) would otherwise swap Vin and Vout
+    cents = [np.argwhere(m).mean(axis=0) if m.any() else np.zeros(2) for m in masks]
+    axis = 1 if abs(cents[0][1] - cents[1][1]) >= abs(cents[0][0] - cents[1][0]) else 0
+    if cents[0][axis] > cents[1][axis]:
+        masks, photo_masks = masks[::-1], photo_masks[::-1]
+    det["layout"] = "left-right" if axis == 1 else "top-bottom"
     margin = 3
     for name, m in zip(("Vin", "Vout"), photo_masks):
         if m[:margin].any() or m[-margin:].any() or m[:, :margin].any() or m[:, -margin:].any():
@@ -316,6 +413,7 @@ def check_image(image, photo, info, masks, max_size=1600):
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     h, w = img.shape[:2]
     over = img.copy()
+    masks = [m for m in (masks or ()) if m is not None and m.any()]
     for m, color in zip(masks, ((0, 0, 255), (255, 0, 0))):
         over[m] = (0.6 * over[m] + 0.4 * np.array(color)).astype(np.uint8)
         cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -325,9 +423,13 @@ def check_image(image, photo, info, masks, max_size=1600):
     s = max_size / max(h, w)
     left = cv2.resize(over, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
 
-    # zoom: midpoint between the two electrodes, inside the photo
-    cy = int(np.mean([np.argwhere(m)[:, 0].mean() for m in masks]))
-    cx = int(np.mean([np.argwhere(m)[:, 1].mean() for m in masks]))
+    # zoom: midpoint between the two electrodes, or the middle of the photo
+    if len(masks) == 2:
+        cy = int(np.mean([np.argwhere(m)[:, 0].mean() for m in masks]))
+        cx = int(np.mean([np.argwhere(m)[:, 1].mean() for m in masks]))
+    else:
+        cx, cy = (int(v) for v in photo_footprint(photo.shape, M).mean(axis=0))
+    cx, cy = min(max(cx, 0), w - 1), min(max(cy, 0), h - 1)
     half = max(100, min(h, w) // 12)
     y0, x0 = max(0, cy - half), max(0, cx - half)
     sl = (slice(y0, min(h, cy + half)), slice(x0, min(w, cx + half)))
@@ -357,11 +459,13 @@ def _parse_args():
     p.add_argument("photo", help="Later photo that shows the electrodes.")
     p.add_argument("-o", "--output", default=None,
                    help="Base name for the outputs (default: the image path without extension). "
-                        "Writes <base>_electrode_mask1.tif, _mask2.tif and _electrode_check.jpg.")
+                        "Writes <base>_photo_aligned.tif, _electrode_mask1.tif, _mask2.tif and "
+                        "_electrode_check.jpg.")
     p.add_argument("--scale", type=float, default=None,
                    help="Approximate image px per photo px (e.g. 2 for 5x on 10x). Default: search.")
     p.add_argument("--feature", choices=FEATURES, default="auto",
-                   help="How the electrodes differ from the bare network in the photo.")
+                   help="How the electrodes differ from the bare network in the photo; "
+                        "'none' only aligns the photo (paint the electrodes by hand).")
     p.add_argument("--sigma", type=float, default=15, help="Smoothing for the detection (photo px).")
     p.add_argument("-q", "--quiet", action="store_true")
     return p.parse_args()
@@ -375,20 +479,24 @@ def main():
     m1, m2, info = electrodes_from_photo(image, photo, scale=args.scale, feature=args.feature,
                                          sigma=args.sigma, verbose=verbose)
     base = args.output or os.path.splitext(args.image)[0]
-    imwrite(base + "_electrode_mask1.tif", m1.astype(np.uint8) * 255)
-    imwrite(base + "_electrode_mask2.tif", m2.astype(np.uint8) * 255)
+    imwrite(base + "_photo_aligned.tif", warp_photo(photo, info["M"], image.shape))
+    if m1 is not None:
+        imwrite(base + "_electrode_mask1.tif", m1.astype(np.uint8) * 255)
+        imwrite(base + "_electrode_mask2.tif", m2.astype(np.uint8) * 255)
     imwrite(base + "_electrode_check.jpg", check_image(image, photo, info, (m1, m2)),
             (cv2.IMWRITE_JPEG_QUALITY, 90))
     if verbose:
         print(f"Aligned: scale {info['scale']:.3f}, rotation {info['rotation_deg']:.2f} deg, "
               f"{info['inliers']}/{info['matches']} consistent matches, "
               f"residual {info['residual_median']:.2f} px (90%: {info['residual_p90']:.2f}).")
-        print(f"Electrodes detected with feature '{info['detect_feature']}' "
-              f"({info['detect_layout']}).")
+        if m1 is not None:
+            print(f"Electrodes detected with feature '{info['detect_feature']}' "
+                  f"({info['detect_layout']}).")
         for wmsg in info["warnings"]:
             print("[warning]", wmsg)
-        print(f"Saved {base}_electrode_mask1.tif (Vin), _electrode_mask2.tif (Vout) "
-              f"and _electrode_check.jpg.")
+        print(f"Saved {base}_photo_aligned.tif (the photo in the image coordinates) "
+              + ("_electrode_mask1.tif (Vin), _electrode_mask2.tif (Vout) " if m1 is not None else "")
+              + "and _electrode_check.jpg.")
 
 
 if __name__ == "__main__":
