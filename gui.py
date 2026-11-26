@@ -54,7 +54,7 @@ from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QColor, QFont, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
     QProgressBar, QSpinBox, QSplashScreen, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -1087,10 +1087,24 @@ class Pics2GraphWidget(QWidget):
             self._say("Paint both electrodes first.", "warning")
             return
         default = os.path.splitext(self.raw_path)[0] if self.raw_path else ""
+        # The chosen name is only a base: the files written are <base>_electrode_mask1/2.tif.
+        # So the dialog must not complain that <base>.tif (usually the micrograph) exists;
+        # we check the real output files ourselves below.
         base, _ = QFileDialog.getSaveFileName(
-            self, "Base name for the masks (adds _electrode_mask1/2.tif)", default, "TIFF (*.tif)")
+            self, "Base name for the masks (adds _electrode_mask1/2.tif)", default, "TIFF (*.tif)",
+            options=QFileDialog.DontConfirmOverwrite)
         if base:
             base = os.path.splitext(base)[0]
+            for suffix in ("_electrode_mask1", "_electrode_mask2"):
+                if base.endswith(suffix):  # user picked an existing mask file
+                    base = base[: -len(suffix)]
+            existing = [os.path.basename(base + s) for s in
+                        ("_electrode_mask1.tif", "_electrode_mask2.tif") if os.path.exists(base + s)]
+            if existing and QMessageBox.question(
+                    self, "Overwrite masks?",
+                    "Already exists:\n" + "\n".join(existing) + "\n\nReplace?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
             imwrite(base + "_electrode_mask1.tif", masks[0])
             imwrite(base + "_electrode_mask2.tif", masks[1])
             self._say(f"Saved {base}_electrode_mask1.tif and _electrode_mask2.tif.")
